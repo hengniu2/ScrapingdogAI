@@ -7,13 +7,17 @@ const fs = require('fs');
 // ---------------------------------------------------------------------------
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY || 'sk-or-v1-key';
 const SCRAPINGDOG_KEY = process.env.SCRAPINGDOG_KEY || 'key';
-const OUTPUT_FILE = process.env.OUTPUT_FILE || 'askAI.json';
-
+// Console-first: the full result is printed to stdout. A file is written ONLY
+// if you explicitly set OUTPUT_FILE, e.g. OUTPUT_FILE=result.json node askAI.js
+const OUTPUT_FILE = process.env.OUTPUT_FILE || null;
 
 const SCENARIO = Number(process.env.SCENARIO || 2);
-// fresh=true forces Scrapingdog to do a live LinkedIn scrape on every call,
-// which is the slowest part of the profile fetch. Default to cached (fresh=false)
-// for speed; set LINKEDIN_FRESH=true when you specifically need a live re-scrape.
+// The LinkedIn Profile API is the ground-truth source for the experience section.
+// It was being called with a 1s timeout (so it ALWAYS failed and experience was
+// rebuilt from less-accurate web research). Give it a real timeout so the scraped
+// profile is used when available. fresh=false uses Scrapingdog's cached scrape
+// (faster, same fields); set LINKEDIN_FRESH=true to force a live re-scrape.
+const LINKEDIN_TIMEOUT_MS = Number(process.env.LINKEDIN_TIMEOUT_MS || 30000);
 const LINKEDIN_FRESH = process.env.LINKEDIN_FRESH === 'true';
 const LINKEDIN_PROFILE_FALLBACK =
   process.env.LINKEDIN_PROFILE_FALLBACK !== 'false';
@@ -47,21 +51,23 @@ const PRIVATE_PROFILE_MODEL =
 const AI_MODE_MAX_CALLS = Number(
   process.env.AI_MODE_MAX_CALLS || (RESEARCH_MODE === 'off' ? 0 : -1)
 );
-// Research latency is dominated by AI Mode round-trips. They are independent, so
-// the cheapest speedup is running more of them at once and not retrying dead
-// calls. Concurrency 10 collapses the typical ~13 initial queries from ~4 waves
-// into ~2; retries default to 0 so one hung call never serially blocks a worker.
 const AI_MODE_CONCURRENCY = Number(process.env.AI_MODE_CONCURRENCY || 10);
+// All AI Mode queries fire in one concurrent wave, so the research phase's
+// wall-clock = the SLOWEST single call. Retries are off and the per-call timeout
+// is capped so one slow/hanging call can no longer balloon the whole run (that
+// was the 23s-vs-56s swing). A dropped slow call costs at most one query out of
+// ~8; synthesis (the source of the rich about text) is untouched.
 const AI_MODE_RETRIES = Number(process.env.AI_MODE_RETRIES || 0);
 const AI_MODE_RETRY_DELAY_MS = Number(
   process.env.AI_MODE_RETRY_DELAY_MS || 800
 );
-// AI Mode usually answers in 15-30s. Because every query runs concurrently in
-// one wave, the research phase's wall-clock = the slowest single call, so this
-// timeout is effectively the research-phase ceiling. 30s caps the tail; with
-// retries off a timeout just drops that one query (fallback providers still fill
-// in if it mattered). Raise it if you see useful queries getting cut.
-const AI_MODE_TIMEOUT_MS = Number(process.env.AI_MODE_TIMEOUT_MS || 30000);
+const AI_MODE_TIMEOUT_MS = Number(process.env.AI_MODE_TIMEOUT_MS || 18000);
+// The paid web-search fallback (Perplexity/OpenRouter) fires after the AI Mode
+// wave when results look weak, and it ran with a 90s timeout -> the occasional
+// 35s+ research spike. Cap it so it can never blow the time budget.
+const SEARCH_FALLBACK_TIMEOUT_MS = Number(
+  process.env.SEARCH_FALLBACK_TIMEOUT_MS || 15000
+);
 const AI_MODE_MAX_QUERY_CHARS = Number(
   process.env.AI_MODE_MAX_QUERY_CHARS || 900
 );
@@ -70,16 +76,13 @@ const PERPLEXITY_BATCH_SIZE = Number(
   process.env.PERPLEXITY_BATCH_SIZE || (RESEARCH_MODE === 'deep' ? 6 : 8)
 );
 const EXPERIENCE_FOLLOWUP_LIMIT = Number(
-  process.env.EXPERIENCE_FOLLOWUP_LIMIT || (RESEARCH_MODE === 'deep' ? 5 : 3)
+  process.env.EXPERIENCE_FOLLOWUP_LIMIT || (RESEARCH_MODE === 'deep' ? 8 : 5)
 );
-// The planner-driven second research pass (plan -> follow-up queries) is a fully
-// sequential extra round-trip: it must wait for ALL first-pass research before
-// it can run, then runs more searches. That is the single biggest serial cost in
-// "standard" mode. Default it on only for "deep"; "standard" relies on the
-// broader first pass + the conditional rescue. Re-enable with
-// EXPERIENCE_FOLLOWUP_ENABLED=true. Sparse/private fallbacks always keep it
-// (they have almost no baseline, so the second pass is where their data comes
-// from) unless explicitly disabled.
+// The follow-up planning pass runs a planner LLM + a SECOND research wave to hunt
+// for hidden roles. That mattered when experience was rebuilt from scratch, but
+// now the real LinkedIn profile supplies the accurate experience, so the first
+// pass is enough. Default it to "deep" mode only (saves ~10s in standard).
+// Set EXPERIENCE_FOLLOWUP_ENABLED=true to force it on.
 const EXPERIENCE_FOLLOWUP_ENABLED =
   process.env.EXPERIENCE_FOLLOWUP_ENABLED === 'true' ||
   (process.env.EXPERIENCE_FOLLOWUP_ENABLED !== 'false' &&
@@ -92,9 +95,11 @@ const RESCUE_SEARCH_MODEL =
   process.env.RESCUE_SEARCH_MODEL || 'perplexity/sonar';
 const RESCUE_CONTEXT_CHARS = Number(process.env.RESCUE_CONTEXT_CHARS || 3500);
 const RESCUE_FIELD_CHARS = Number(process.env.RESCUE_FIELD_CHARS || 500);
-// AI Mode + LLM is the least reliable ID source (it produced the wrong
-// ProfitIndustry -> iccg-usa match). Off by default; deterministic SERP/website
-// tiers run instead. Set COMPANY_ID_LOOKUP_ENABLED=true to re-enable.
+// Company LinkedIn-ID resolution costs a full extra AI Mode call + an LLM parse
+// (~15-18s) just to fill experience[].company_linkedin_id — it does NOT add the
+// about text / descriptions / references. Off by default so it never sits on the
+// critical path. Set COMPANY_ID_LOOKUP_ENABLED=true if you specifically need the
+// company LinkedIn IDs.
 const COMPANY_ID_LOOKUP_ENABLED =
   process.env.COMPANY_ID_LOOKUP_ENABLED === 'true';
 const COMPANY_ID_LOOKUP_LIMIT = Number(process.env.COMPANY_ID_LOOKUP_LIMIT || 8);
@@ -102,31 +107,6 @@ const COMPANY_ID_LOOKUP_LIMIT = Number(process.env.COMPANY_ID_LOOKUP_LIMIT || 8)
 // AI Mode is an internal product, so public contact research is enabled by
 // default. Set INCLUDE_CONTACT=false when a product tier does not need it.
 const INCLUDE_CONTACT = process.env.INCLUDE_CONTACT !== 'false';
-
-// When the /profile API fails (or is intentionally bypassed), rebuild the
-// identity anchor from the public Google SERP for the exact profile slug. This
-// replaces the sparse fallback with a real baseline (name/role/company/location)
-// so the normal experience-first research path runs instead of the crippled
-// LinkedIn-anchor-only path.
-const SERP_BASELINE_ENABLED = process.env.SERP_BASELINE_ENABLED !== 'false';
-const SERP_COUNTRY = process.env.SERP_COUNTRY || 'us';
-const SERP_RESULTS = Number(process.env.SERP_RESULTS || 10);
-const SERP_TIMEOUT_MS = Number(process.env.SERP_TIMEOUT_MS || 15000);
-// Resolve company LinkedIn slugs deterministically via SERP company dorks
-// instead of (or before) the bundled AI Mode lookup.
-const SERP_COMPANY_LOOKUP_ENABLED =
-  process.env.SERP_COMPANY_LOOKUP_ENABLED !== 'false';
-const SERP_COMPANY_CONCURRENCY = Number(
-  process.env.SERP_COMPANY_CONCURRENCY || 8
-);
-// Indexing-independent tier: resolve a company's LinkedIn slug from its own
-// website (the company links its own LinkedIn page). Catches companies whose
-// LinkedIn page is not in Google's index.
-const COMPANY_WEBSITE_LOOKUP_ENABLED =
-  process.env.COMPANY_WEBSITE_LOOKUP_ENABLED !== 'false';
-const COMPANY_WEBSITE_TIMEOUT_MS = Number(
-  process.env.COMPANY_WEBSITE_TIMEOUT_MS || 5000
-);
 
 function envList(name, fallback) {
   return (process.env[name] || fallback)
@@ -148,32 +128,30 @@ function openRouterModelOptions(model) {
 }
 
 // Cheap structured-output models. Escalation is used only if validation fails.
-// Order = speed-first cascade. gemini-2.5-flash-lite is far faster than the 70B
-// hermes model (synthesis was ~14s on hermes), and strict json_schema mode +
-// post-synthesis validation make it safe to try first: if its output fails
-// validation it automatically falls through to hermes (kept as the quality
-// fallback). Override with SYNTHESIS_MODELS to put hermes first if you find the
-// experience section is less complete.
+// Fast-first cascade for a reliable sub-30s synthesis. gemini-2.5-flash-lite is
+// fast (~5-16s) and consistent; hermes/gpt-4o-mini are validation fallbacks. The
+// fast model can be lossy with experience descriptions / about text, so
+// preserveBaselineData() deterministically restores those from the real LinkedIn
+// profile after synthesis -> accurate experience is guaranteed regardless of model.
 const SYNTHESIS_MODELS = envList(
   'SYNTHESIS_MODELS',
-  'google/gemini-2.5-flash-lite,nousresearch/hermes-4-70b,openai/gpt-4o-mini'
+  'google/gemini-2.5-flash-lite,openai/gpt-4o-mini,nousresearch/hermes-4-70b'
 );
 
 const PLANNER_MODELS = envList(
   'PLANNER_MODELS',
-  'google/gemini-2.5-flash-lite,nousresearch/hermes-4-70b,openai/gpt-4o-mini'
+  'nousresearch/hermes-4-70b,google/gemini-2.5-flash-lite,openai/gpt-4o-mini'
 );
 
 const MAX_ACTIVITIES = Number(process.env.MAX_ACTIVITIES || 8);
 const MAX_ACTIVITY_CHARS = Number(process.env.MAX_ACTIVITY_CHARS || 500);
 const MAX_RESEARCH_CHARS = Number(process.env.MAX_RESEARCH_CHARS || 10000);
-// Synthesis is a single LLM call whose latency scales with input size. The
-// research blob is highly redundant across queries (and the model dedupes it
-// anyway), so ~60k chars (~15k tokens) keeps the useful signal while roughly
-// halving the synthesis prompt vs the old 120k. Raise it back if you see the
-// model missing older roles that were present in the research.
+// Synthesis latency scales with input size. Now that the real profile supplies
+// the accurate experience, research mainly adds the about text + a little
+// context, so it does not need to be huge. ~35k chars (~9k tokens) keeps the
+// about rich while making hermes synthesis faster and far less variable.
 const MAX_TOTAL_RESEARCH_CHARS = Number(
-  process.env.MAX_TOTAL_RESEARCH_CHARS || 60000
+  process.env.MAX_TOTAL_RESEARCH_CHARS || 35000
 );
 
 const METRICS = {
@@ -183,8 +161,6 @@ const METRICS = {
   openrouter_search_calls: 0,
   scrapingdog_ai_calls: 0,
   scrapingdog_ai_failures: 0,
-  serp_calls: 0,
-  serp_failures: 0,
   linkedin_api_calls: 0,
   linkedin_api_failures: 0,
 };
@@ -198,7 +174,7 @@ const EXISTING_PROFILE = {
 
 const LINKEDIN_URL =
   process.env.LINKEDIN_URL ||
-  'https://www.linkedin.com/in/yuriburchenya/';
+  'https://www.linkedin.com/in/shravantickoo/';
 
 const FIRST_NAME = process.env.FIRST_NAME || 'Elon';
 const LAST_NAME = process.env.LAST_NAME || 'Musk';
@@ -274,6 +250,7 @@ const PROFILE_SCHEMA = {
           start_date: nullableString,
           end_date: nullableString,
           description: nullableString,
+          company_url: nullableString,
           company_linkedin_id: nullableString,
         },
         required: [
@@ -283,6 +260,7 @@ const PROFILE_SCHEMA = {
           'start_date',
           'end_date',
           'description',
+          'company_url',
           'company_linkedin_id',
         ],
       },
@@ -467,56 +445,6 @@ const COMPANY_ID_LOOKUP_SCHEMA = {
   required: ['companies'],
 };
 
-const BASELINE_ANCHOR_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  properties: {
-    name: nullableString,
-    headline: nullableString,
-    current_role: nullableString,
-    current_company: nullableString,
-    location: nullableString,
-    experience: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          company: nullableString,
-          title: nullableString,
-          start_date: nullableString,
-          end_date: nullableString,
-        },
-        required: ['company', 'title', 'start_date', 'end_date'],
-      },
-    },
-    education: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          institution: nullableString,
-          degree: nullableString,
-          field: nullableString,
-          start_year: { type: ['integer', 'null'] },
-          end_year: { type: ['integer', 'null'] },
-        },
-        required: ['institution', 'degree', 'field', 'start_year', 'end_year'],
-      },
-    },
-  },
-  required: [
-    'name',
-    'headline',
-    'current_role',
-    'current_company',
-    'location',
-    'experience',
-    'education',
-  ],
-};
-
 const SYSTEM_PROMPT = `
 You are a professional profile enrichment engine.
 
@@ -656,6 +584,7 @@ function compactProfile(rawProfile, linkedinUrl = '') {
         end_date: item.end_date || item.ends_at || item.endDate || null,
         duration: item.duration || null,
         description: trimText(item.description || item.summary || null, 1000),
+        company_url: companyUrl,
         company_linkedin_id:
           firstPresent(
             item.company_linkedin_id,
@@ -873,6 +802,7 @@ function cleanExperienceEntry(item) {
     start_date: item?.start_date || null,
     end_date: item?.end_date || null,
     description: item?.description || null,
+    company_url: companyUrl,
     company_linkedin_id:
       firstPresent(
         item?.company_linkedin_id,
@@ -934,7 +864,16 @@ async function callStructuredAI(userPrompt) {
             { role: 'user', content: userPrompt },
           ],
           temperature: 0.1,
-          max_tokens: 3500,
+          // A full enriched profile (rich about + many experience rows with
+          // descriptions) often needs >3500 output tokens. If the model hits the
+          // cap mid-JSON the response is truncated -> JSON.parse fails -> it
+          // cascades to a leaner model that returns about: null. 8000 lets the
+          // strong model finish in one call -> reliable, rich output.
+          max_tokens: Number(process.env.SYNTHESIS_MAX_TOKENS || 8000),
+          // Route to the fastest provider for this model. hermes-4-70b latency
+          // swings a lot across OpenRouter providers (13s vs 29s); sorting by
+          // throughput keeps synthesis fast and consistent without changing model.
+          provider: { sort: 'throughput' },
           ...openRouterModelOptions(model),
           response_format: {
             type: 'json_schema',
@@ -1038,6 +977,8 @@ async function scrapingdogAI(query) {
       );
 
       const data = response.data || {};
+
+      console.log(data)
 
       const references = (data.references || [])
         .filter((item) => item.link)
@@ -1388,7 +1329,8 @@ function sanitizePrivateFallbackResult(result, profile, research) {
     .trim()
     .split(/\s+/)
     .filter(Boolean);
-  const profileId = resolveProfileId(profile);
+  const profileId =
+    profile.linkedin_public_identifier || getLinkedInProfileId(profile.linkedin_url || '');
 
   return {
     ...result,
@@ -1440,22 +1382,13 @@ function sanitizePrivateFallbackResult(result, profile, research) {
   };
 }
 
-// The full post-synthesis guard chain, applied identically after the first
-// synthesis and after the rescue re-synthesis. Order matters: private-fallback
-// stripping runs before the low-evidence baseline check.
-function applyResultSanitizers(result, profile, research) {
-  result = sanitizePrivateFallbackResult(result, profile, research);
-  result = sanitizePrivateFallbackExperience(result, profile, research);
-  result = sanitizeLowEvidenceBaselineResult(result, profile, research);
-  return result;
-}
-
 function buildProfileNotFoundResult(profile) {
   const rawNameParts = String(profile.name || '')
     .trim()
     .split(/\s+/)
     .filter(Boolean);
-  const profileId = resolveProfileId(profile);
+  const profileId =
+    profile.linkedin_public_identifier || getLinkedInProfileId(profile.linkedin_url || '');
 
   return {
     status: 404,
@@ -1547,7 +1480,7 @@ async function openRouterResearch(query, model, label, maxTokens = 2500) {
       },
       {
         headers: openRouterHeaders(),
-        timeout: 90000,
+        timeout: SEARCH_FALLBACK_TIMEOUT_MS,
       }
     );
 
@@ -1653,7 +1586,8 @@ async function openAiPrivateProfileFallback(profile, items) {
   }
 
   const signals = profileSignals(profile);
-  const profileId = resolveProfileId(profile);
+  const profileId =
+    profile.linkedin_public_identifier || getLinkedInProfileId(profile.linkedin_url || '');
   const requestedSections = items
     .map((item, index) => `[${index + 1}] ${item.label}\n${item.query}`)
     .join('\n\n---\n\n');
@@ -1711,6 +1645,7 @@ function compactExperienceForPrompt(experience, limit = 8) {
       start_date: item.start_date || null,
       end_date: item.end_date || null,
       description: trimText(item.description || '', RESCUE_FIELD_CHARS) || null,
+      company_url: item.company_url || null,
       company_linkedin_id: item.company_linkedin_id || null,
     }));
 }
@@ -2086,7 +2021,7 @@ async function fetchLinkedInProfile(linkedinUrl) {
         id: profileId,
         fresh: LINKEDIN_FRESH ? 'true' : 'false',
       },
-      timeout: 30000,
+      timeout: LINKEDIN_TIMEOUT_MS,
     }
   );
 
@@ -2099,15 +2034,6 @@ async function fetchLinkedInProfile(linkedinUrl) {
 
 function getLinkedInProfileId(linkedinUrl) {
   return linkedinUrl.split('/in/')[1]?.split(/[/?#]/)[0] || '';
-}
-
-// The profile slug, preferring an explicit identifier and falling back to the
-// one parsed from the LinkedIn URL. Used wherever we anchor identity.
-function resolveProfileId(profile) {
-  return (
-    profile.linkedin_public_identifier ||
-    getLinkedInProfileId(profile.linkedin_url || '')
-  );
 }
 
 function nameFromLinkedInProfileId(profileId) {
@@ -2162,256 +2088,21 @@ function buildLinkedInFallbackProfile(linkedinUrl, reason) {
   };
 }
 
-async function serpSearch(query, results = SERP_RESULTS) {
-  try {
-    METRICS.serp_calls += 1;
-    const response = await axios.get('https://api.scrapingdog.com/google', {
-      params: {
-        api_key: SCRAPINGDOG_KEY,
-        query,
-        results,
-        country: SERP_COUNTRY,
-      },
-      timeout: SERP_TIMEOUT_MS,
-    });
-    const data = response.data || {};
-    return Array.isArray(data.organic_results) ? data.organic_results : [];
-  } catch (error) {
-    METRICS.serp_failures += 1;
-    console.warn(`  SERP search failed: ${error.message}`);
-    return [];
-  }
-}
-
-function nameFromSerpTitle(title) {
-  // "Darshan Khandelwal - Co-Founder Scrapingdog.com - LinkedIn"
-  const cleaned = String(title || '')
-    .replace(/\s*[|\-–]\s*LinkedIn.*$/i, '')
-    .trim();
-  if (!cleaned) return { name: null, headline: null };
-  const parts = cleaned.split(/\s+[-–|]\s+/);
-  return {
-    name: (parts[0] || '').trim() || null,
-    headline: parts.slice(1).join(' - ').trim() || null,
-  };
-}
-
-function serpLinkMatchesSlug(item, slug) {
-  const link = normalizedEvidenceText(item.link || item.url || '');
-  const target = `linkedin.com/in/${normalizedEvidenceText(slug)}`;
-  return !!link && link.includes(target);
-}
-
-// A SERP result is tied to this exact identity if its link is the profile slug
-// page, or its title/url/snippet mentions the exact slug or profile URL. This is
-// what keeps the richer multi-result baseline free of same-name contamination.
-function serpResultIsIdentityAnchored(item, slug, linkedinUrl) {
-  if (serpLinkMatchesSlug(item, slug)) return true;
-
-  const hay = normalizedEvidenceText(
-    `${item.title || ''} ${item.link || item.url || ''} ${item.snippet || ''}`
-  );
-  const slugKey = normalizedEvidenceText(slug);
-  const urlKey = normalizedEvidenceText(linkedinUrl).replace(/\/+$/g, '');
-
-  return (
-    (!!slugKey && hay.includes(`/in/${slugKey}`)) ||
-    (!!urlKey && hay.includes(urlKey))
-  );
-}
-
-function serpResultEvidenceBlock(item, index) {
-  return [
-    `[result ${index + 1}]`,
-    `title: ${item.title || ''}`,
-    `url: ${item.link || item.url || ''}`,
-    `snippet: ${trimText(item.snippet || '', 600)}`,
-  ].join('\n');
-}
-
-// Rebuilds the identity anchor that /profile used to provide, using only the
-// public Google SERP for the exact profile slug. Two identity-anchored angles
-// run together: the profile page itself (site:linkedin.com/in/<slug> pins it to
-// rank 1, an identity lock with no same-name risk) AND pages that quote the
-// exact profile URL (posts, aggregators, bios). Aggregating snippets across the
-// anchored results gives the extractor far more context than a single result, so
-// the recovered baseline carries real current-role/company/location/older-role
-// data instead of just a name -> this is the main "more data when the Profile
-// API fails" path. Returns a NON-sparse baseline so the normal
-// experience-first research path runs downstream.
-async function reconstructBaselineFromPublic(linkedinUrl) {
-  if (!SERP_BASELINE_ENABLED) return null;
-
-  const slug = getLinkedInProfileId(linkedinUrl);
-  if (!slug) return null;
-
-  const cleanUrl = linkedinUrl.replace(/\/?$/, '/');
-  const [slugResults, urlResults] = await Promise.all([
-    serpSearch(`site:linkedin.com/in/${slug}`),
-    serpSearch(`"${cleanUrl}"`),
-  ]);
-
-  const organic = [...slugResults, ...urlResults];
-  if (!organic.length) {
-    console.warn('  SERP baseline: no indexed result for this profile slug.');
-    return null;
-  }
-
-  const anchoredResults = dedupeBy(
-    organic.filter((item) =>
-      serpResultIsIdentityAnchored(item, slug, linkedinUrl)
-    ),
-    (item) => normalizedEvidenceText(item.link || item.url || '')
-  );
-
-  const lockedResult = anchoredResults.find((item) =>
-    serpLinkMatchesSlug(item, slug)
-  );
-  const identityLocked = !!lockedResult;
-
-  // Locked LinkedIn page first, then the rest of the anchored context. If
-  // nothing is anchored, fall back to the old single-top-result behavior.
-  const contextResults = (
-    anchoredResults.length
-      ? dedupeBy(
-          [lockedResult, ...anchoredResults].filter(Boolean),
-          (item) => normalizedEvidenceText(item.link || item.url || '')
-        )
-      : [organic[0]]
-  ).slice(0, 6);
-
-  const anchor = lockedResult || contextResults[0] || organic[0];
-  if (!anchor || !(anchor.title || anchor.snippet)) {
-    console.warn('  SERP baseline: top result had no title/snippet to parse.');
-    return null;
-  }
-
-  const heuristic = nameFromSerpTitle(anchor.title);
-
-  const evidenceBlock = contextResults
-    .map((item, index) => serpResultEvidenceBlock(item, index))
-    .join('\n\n');
-
-  let extracted = null;
-  try {
-    extracted = await callJsonAI({
-      label: 'serp_baseline_anchor',
-      systemPrompt:
-        'You extract a structured professional baseline from Google search ' +
-        'results for one exact LinkedIn profile. Use only facts present in the ' +
-        'supplied result titles and snippets. Merge facts across results when ' +
-        'they clearly describe the same person. Never invent. Use null/[] when ' +
-        'absent.',
-      userPrompt: `LinkedIn URL: ${linkedinUrl}
-Profile slug: ${slug}
-
-Search results (all tied to this exact profile slug/URL):
-${evidenceBlock}
-
-Extract name, headline, current_role, current_company, location, any visible
-experience rows (company/title/dates), and education. Merge consistent facts
-across the results. Do not use outside knowledge. Do not include same-name
-people.`,
-      schema: BASELINE_ANCHOR_SCHEMA,
-      maxTokens: 1100,
-      models: PLANNER_MODELS,
-    });
-  } catch (error) {
-    console.warn(
-      `  SERP baseline extraction failed, using title heuristic: ${error.message}`
-    );
-  }
-
-  const seedExperience = Array.isArray(extracted?.experience)
-    ? extracted.experience
-        .filter((row) => row && (row.company || row.title))
-        .map((row) => ({
-          company: row.company || null,
-          title: row.title || null,
-          location: null,
-          start_date: row.start_date || null,
-          end_date: row.end_date || null,
-          duration: null,
-          description: null,
-          company_linkedin_id: null,
-        }))
-    : [];
-
-  const name =
-    extracted?.name || heuristic.name || nameFromLinkedInProfileId(slug);
-  const headline = extracted?.headline || heuristic.headline || null;
-  const currentCompany =
-    extracted?.current_company || seedExperience[0]?.company || null;
-  const currentRole =
-    extracted?.current_role || seedExperience[0]?.title || null;
-
-  return {
-    profile_source: 'serp_reconstructed',
-    serp_identity_locked: identityLocked,
-    fallback_reason: 'linkedin_profile_api_unavailable_used_serp_baseline',
-    name,
-    headline,
-    current_company: currentCompany,
-    current_role: currentRole,
-    location: extracted?.location || null,
-    linkedin_url: linkedinUrl,
-    linkedin_public_identifier: slug,
-    website: null,
-    about: null,
-    followers: null,
-    connections: null,
-    is_open_to_work: false,
-    is_hiring: false,
-    email: null,
-    phone: null,
-    social_links: [],
-    experience: seedExperience,
-    education: Array.isArray(extracted?.education) ? extracted.education : [],
-    skills: [],
-    languages: [],
-    certifications: [],
-    activities: [],
-    anchor_reference: {
-      title: anchor.title || null,
-      url: anchor.link || anchor.url || null,
-      snippet: trimText(anchor.snippet || '', 500),
-    },
-  };
-}
-
 async function fetchLinkedInProfileOrFallback(linkedinUrl) {
-  let profileError;
-
   try {
     return compactProfile(await fetchLinkedInProfile(linkedinUrl), linkedinUrl);
   } catch (error) {
     METRICS.linkedin_api_failures += 1;
-    profileError = error;
-    console.warn(
-      `  LinkedIn profile API failed (${error.message}). Trying SERP baseline reconstruction...`
-    );
-  }
 
-  if (SERP_BASELINE_ENABLED) {
-    const reconstructed = await reconstructBaselineFromPublic(linkedinUrl);
-    if (reconstructed) {
-      console.log(
-        `  SERP baseline recovered: ${reconstructed.name || '-'} | ` +
-          `${reconstructed.current_role || '-'} @ ${reconstructed.current_company || '-'} ` +
-          `(identity_locked=${reconstructed.serp_identity_locked})`
-      );
-      return reconstructed;
+    if (!LINKEDIN_PROFILE_FALLBACK) {
+      throw error;
     }
-  }
 
-  if (!LINKEDIN_PROFILE_FALLBACK) {
-    throw profileError;
+    console.warn(
+      `  LinkedIn profile API failed. Continuing with AI Mode fallback: ${error.message}`
+    );
+    return buildLinkedInFallbackProfile(linkedinUrl, error.message);
   }
-
-  console.warn(
-    '  No SERP baseline available. Continuing with sparse AI Mode fallback.'
-  );
-  return buildLinkedInFallbackProfile(linkedinUrl, profileError.message);
 }
 
 // ---------------------------------------------------------------------------
@@ -2516,427 +2207,58 @@ function cleanCompanyLookupRecord(item) {
   };
 }
 
-function companyEvidenceMatchesName(company, id, title = '') {
-  const companyFlat = normalizedCompanyKey(company).replace(/ /g, '');
-  if (!companyFlat) return false;
-
-  const slugFlat = normalizedText(id).replace(/[^a-z0-9]/g, '');
-  const titleFlat = normalizedCompanyKey(
-    String(title).replace(/\s*[|\-–]\s*linkedin.*$/i, '')
-  ).replace(/ /g, '');
-
-  if (!slugFlat && !titleFlat) return false;
-
-  // Strongest signal: the LinkedIn page's own name equals the company name.
-  if (titleFlat && titleFlat === companyFlat) return true;
-  // Exact slug match.
-  if (slugFlat && slugFlat === companyFlat) return true;
-
-  // Allow only a company name plus a harmless domain/corp suffix (g2 -> g2dotcom),
-  // never company + a real extra word (apple -> applesauce-farms is rejected).
-  const SUFFIX = /^(inc|llc|co|com|dotcom|io|ai|hq)$/;
-  if (slugFlat && slugFlat.startsWith(companyFlat)) {
-    if (SUFFIX.test(slugFlat.slice(companyFlat.length))) return true;
-  }
-  if (slugFlat && companyFlat.startsWith(slugFlat)) {
-    if (SUFFIX.test(companyFlat.slice(slugFlat.length))) return true;
-  }
-
-  return false;
-}
-
-function serpCompanyMatch(item, company) {
-  const link = normalizeLinkedInCompanyUrl(item.link || item.url || '');
-  if (!link || !/linkedin\.com\/(?:company|school)\//i.test(link)) return null;
-
-  const id = extractLinkedInCompanyId(link);
-  if (!id) return null;
-
-  // The site dork already constrains Google to pages naming the company; this
-  // name check is a guard against accepting a wrong-company page.
-  if (!companyEvidenceMatchesName(company, id, item.title)) return null;
-
-  return {
-    company,
-    linkedin_url: link,
-    linkedin_id: id,
-    confidence: 'high',
-    source_url: link,
-  };
-}
-
-async function resolveCompanyLinkedInIdViaSerp(company) {
-  // Run the company and school dorks together, but keep company-before-school
-  // priority when picking the match (a real org should win over a same-named
-  // school page).
-  const [companyResults, schoolResults] = await Promise.all([
-    serpSearch(`site:linkedin.com/company ${JSON.stringify(company)}`, 5),
-    serpSearch(`site:linkedin.com/school ${JSON.stringify(company)}`, 5),
-  ]);
-
-  for (const organic of [companyResults, schoolResults]) {
-    for (const item of organic) {
-      const match = serpCompanyMatch(item, company);
-      if (match) return match;
-    }
-  }
-
-  return null;
-}
-
-async function resolveCompanyLinkedInIdsViaSerp(targets) {
-  const byCompany = new Map();
-  if (!SERP_COMPANY_LOOKUP_ENABLED || !targets.length) return byCompany;
-
-  const matches = await mapWithConcurrency(
-    targets,
-    SERP_COMPANY_CONCURRENCY,
-    (target) => resolveCompanyLinkedInIdViaSerp(target.company)
-  );
-
-  for (const match of matches) {
-    if (!match) continue;
-    const key = normalizedCompanyKey(match.company);
-    if (key) byCompany.set(key, match);
-  }
-
-  return byCompany;
-}
-
-// Indexing-independent resolver: find the company's homepage, then read its
-// LinkedIn company link straight from the page. Works even when the LinkedIn
-// page itself is not indexed by Google, as long as the company has a live site.
-function isOfficialSiteCandidate(link, company) {
-  if (!/^https?:\/\//i.test(link)) return false;
-  if (
-    /(linkedin|facebook|twitter|x\.com|instagram|youtube|tiktok|crunchbase|wikipedia|bloomberg|glassdoor|indeed|pitchbook|zoominfo|medium|github)\./i.test(
-      link
-    )
-  ) {
-    return false;
-  }
-  let url;
-  try {
-    url = new URL(link);
-  } catch {
-    return false;
-  }
-
-  const host = url.hostname || '';
-  const hostKey = normalizedText(host).replace(/[^a-z0-9]/g, '');
-  const pathDepth = url.pathname
-    .split('/')
-    .map((part) => part.trim())
-    .filter(Boolean).length;
-  const tokens = normalizedCompanyKey(company)
-    .split(' ')
-    .filter((t) => t.length > 2)
-    .map((t) => t.replace(/[^a-z0-9]/g, ''));
-
-  const companyFlat = normalizedCompanyKey(company).replace(/ /g, '');
-  const hostMatchesCompany =
-    (companyFlat && hostKey.includes(companyFlat)) ||
-    tokens.some((t) => t && hostKey.includes(t));
-
-  if (!hostMatchesCompany) return false;
-
-  // Prefer root/homepage-like results. This prevents third-party article URLs
-  // from being treated as official company homepages.
-  return pathDepth <= 1;
-}
-
-async function findCompanyHomepage(company, knownUrl) {
-  if (
-    knownUrl &&
-    /^https?:\/\//i.test(knownUrl) &&
-    !/linkedin\.com/i.test(knownUrl)
-  ) {
-    return knownUrl;
-  }
-
-  const organic = await serpSearch(JSON.stringify(company), 5);
-  const official = organic.find((item) =>
-    isOfficialSiteCandidate(item.link || item.url || '', company)
-  );
-  return official?.link || official?.url || null;
-}
-
-async function resolveCompanyLinkedInIdViaWebsite(company, knownUrl) {
-  if (!COMPANY_WEBSITE_LOOKUP_ENABLED) return null;
-
-  const homepage = await findCompanyHomepage(company, knownUrl);
-  if (!homepage) return null;
-
-  let html = '';
-  try {
-    const response = await axios.get(homepage, {
-      timeout: COMPANY_WEBSITE_TIMEOUT_MS,
-      maxContentLength: 4_000_000,
-      maxRedirects: 4,
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProfileEnricher/1.0)' },
-    });
-    html =
-      typeof response.data === 'string'
-        ? response.data
-        : JSON.stringify(response.data);
-  } catch (error) {
-    return null;
-  }
-
-  const match = html.match(
-    /https?:\/\/(?:[a-z]{2,3}\.)?linkedin\.com\/company\/[^"'\s<>?#]+/i
-  );
-  if (!match) return null;
-
-  const link = normalizeLinkedInCompanyUrl(match[0]);
-  const id = extractLinkedInCompanyId(link);
-  if (!id) return null;
-
-  // The company's own site is a good signal, but not enough. Some pages mention
-  // a target company inside unrelated articles and link their own LinkedIn page
-  // (example: ProfitIndustry.com mentioned on AZ Big Media -> az-big-media).
-  // Keep only IDs whose slug/name matches the target company.
-  if (!companyEvidenceMatchesName(company, id, '')) {
-    console.warn(`  Dropping website company mismatch: ${company} -> ${id}`);
-    return null;
-  }
-
-  return {
-    company,
-    linkedin_url: link,
-    linkedin_id: id,
-    confidence: 'high',
-    source_url: homepage,
-  };
-}
-
-async function resolveCompanyLinkedInIdsViaWebsite(targets) {
-  const byCompany = new Map();
-  if (!COMPANY_WEBSITE_LOOKUP_ENABLED || !targets.length) return byCompany;
-
-  const matches = await mapWithConcurrency(
-    targets,
-    SERP_COMPANY_CONCURRENCY,
-    (target) => resolveCompanyLinkedInIdViaWebsite(target.company, null)
-  );
-
-  for (const match of matches) {
-    if (!match) continue;
-    const key = normalizedCompanyKey(match.company);
-    if (key) byCompany.set(key, match);
-  }
-
-  return byCompany;
-}
-
-// Remove any company LinkedIn id/URL the synthesis model invented (e.g.
-// ProfitIndustry -> az-big-media). After this, the only ids that survive are
-// ones whose slug actually matches the company name; everything else is nulled
-// and left for the deterministic resolver to fill (or stay null).
-function stripUnverifiedCompanyIds(result) {
-  let stripped = 0;
-
-  const experience = (result.experience || []).map((raw) => {
-    const item = cleanExperienceEntry(raw);
-    const candidateId = item.company_linkedin_id;
-
-    if (
-      candidateId &&
-      !companyEvidenceMatchesName(item.company, candidateId, '')
-    ) {
-      stripped += 1;
-      return {
-        ...item,
-        company_linkedin_id: null,
-      };
-    }
-
-    return item;
-  });
-
-  if (stripped) {
-    console.log(`  Stripped ${stripped} unverified company LinkedIn id(s).`);
-  }
-
-  return { ...result, experience };
-}
-
-function normalizeExperienceForOutput(result) {
-  return {
-    ...result,
-    experience: (result.experience || []).map((item) => cleanExperienceEntry(item)),
-  };
-}
-
-// Deterministically resolve LinkedIn IDs for the companies already in the
-// baseline profile. These are known before synthesis, so main() runs this
-// concurrently with collectResearch and feeds the result into
-// enrichExperienceCompanyLinkedInIds as a seed -> the company-resolution tail
-// after synthesis only has to handle whatever NEW companies research added.
-// Uses the deterministic SERP + website tiers only (no AI Mode), matching the
-// post-synthesis path's trusted tiers.
-async function prefetchBaselineCompanyIds(profile) {
-  if (!SERP_COMPANY_LOOKUP_ENABLED && !COMPANY_WEBSITE_LOOKUP_ENABLED) {
-    return new Map();
-  }
-
-  const targets = companyLookupTargets(profile);
-  if (!targets.length) return new Map();
-
-  const byCompany = await resolveCompanyLinkedInIdsViaSerp(targets);
-
-  if (COMPANY_WEBSITE_LOOKUP_ENABLED) {
-    const unresolved = targets.filter(
-      (item) => !byCompany.has(normalizedCompanyKey(item.company))
-    );
-    if (unresolved.length) {
-      const websiteMatches = await resolveCompanyLinkedInIdsViaWebsite(
-        unresolved
-      );
-      for (const [key, match] of websiteMatches) {
-        if (!byCompany.has(key)) byCompany.set(key, match);
-      }
-    }
-  }
-
-  if (byCompany.size) {
-    console.log(
-      `  Prefetched ${byCompany.size} baseline company LinkedIn slug(s) during research.`
-    );
-  }
-
-  return byCompany;
-}
-
-async function enrichExperienceCompanyLinkedInIds(
-  result,
-  profile,
-  seedCompanyIds = null
-) {
-  // Always run first: never trust an LLM-produced company id.
-  result = stripUnverifiedCompanyIds(result);
-
-  if (
-    !COMPANY_ID_LOOKUP_ENABLED &&
-    !SERP_COMPANY_LOOKUP_ENABLED &&
-    !COMPANY_WEBSITE_LOOKUP_ENABLED
-  ) {
-    return normalizeExperienceForOutput(result);
-  }
+async function enrichExperienceCompanyLinkedInIds(result, profile) {
+  if (!COMPANY_ID_LOOKUP_ENABLED) return result;
 
   const targets = companyLookupTargets(result);
-  if (!targets.length) return normalizeExperienceForOutput(result);
-
-  // Seed with IDs resolved in parallel with research (baseline companies), then
-  // only resolve the companies that are still missing.
-  const byCompany = new Map();
-  if (seedCompanyIds) {
-    for (const [key, match] of seedCompanyIds) byCompany.set(key, match);
-  }
-  const prefetchedHits = targets.filter((item) =>
-    byCompany.has(normalizedCompanyKey(item.company))
-  ).length;
-
-  const targetsToResolve = targets.filter(
-    (item) => !byCompany.has(normalizedCompanyKey(item.company))
-  );
+  if (!targets.length) return result;
 
   console.log(
-    `  Resolving ${targetsToResolve.length} missing company LinkedIn IDs ` +
-      `(${prefetchedHits} prefetched during research)...`
+    `  Resolving ${targets.length} missing company LinkedIn IDs...`
   );
 
-  // Primary: deterministic per-company SERP resolution.
-  const serpResolved = await resolveCompanyLinkedInIdsViaSerp(targetsToResolve);
-  let serpAdded = 0;
-  for (const [key, match] of serpResolved) {
-    if (!byCompany.has(key)) {
-      byCompany.set(key, match);
-      serpAdded += 1;
-    }
-  }
-  if (serpAdded) {
-    console.log(`  SERP resolved ${serpAdded} company LinkedIn slugs.`);
+  const query = buildCompanyIdLookupQuery(targets, result, profile);
+  const aiModeResult = await scrapingdogAI(query);
+  if (!isUsefulResearchResult(aiModeResult)) {
+    console.warn('  Company LinkedIn ID lookup returned no usable evidence.');
+    return result;
   }
 
-  const unresolvedAfterSerp = targets.filter(
-    (item) => !byCompany.has(normalizedCompanyKey(item.company))
-  );
-
-  // Tier 2 (indexing-independent): read the slug from the company's own site.
-  if (COMPANY_WEBSITE_LOOKUP_ENABLED && unresolvedAfterSerp.length) {
-    const websiteMatches = await resolveCompanyLinkedInIdsViaWebsite(
-      unresolvedAfterSerp
-    );
-    let added = 0;
-    for (const [key, match] of websiteMatches) {
-      if (!byCompany.has(key)) {
-        byCompany.set(key, match);
-        added += 1;
-      }
-    }
-    if (added) {
-      console.log(`  Website tier resolved ${added} company LinkedIn slugs.`);
-    }
-  }
-
-  // Tier 3 (last resort): AI Mode + LLM, only for what is still missing, and
-  // every returned record is name-verified so a wrong-company slug is dropped.
-  const unresolved = targets.filter(
-    (item) => !byCompany.has(normalizedCompanyKey(item.company))
-  );
-
-  if (COMPANY_ID_LOOKUP_ENABLED && unresolved.length) {
-    const query = buildCompanyIdLookupQuery(unresolved, result, profile);
-    const aiModeResult = await scrapingdogAI(query);
-
-    if (isUsefulResearchResult(aiModeResult)) {
-      try {
-        const lookup = await callJsonAI({
-          label: 'company_linkedin_id_lookup',
-          systemPrompt: `
+  let lookup;
+  try {
+    lookup = await callJsonAI({
+      label: 'company_linkedin_id_lookup',
+      systemPrompt: `
 You map company names to official LinkedIn company/school URLs from supplied
 search evidence. Use only the supplied evidence. Do not infer IDs from memory.
 Return not_found when the evidence does not contain an official LinkedIn
 company/school URL.
 `.trim(),
-          userPrompt: `
+      userPrompt: `
 Target companies:
-${JSON.stringify(unresolved.map((item) => item.company), null, 2)}
+${JSON.stringify(targets.map((item) => item.company), null, 2)}
 
 Search evidence:
 ${trimText(aiModeResult, 20000)}
 `.trim(),
-          schema: COMPANY_ID_LOOKUP_SCHEMA,
-          maxTokens: 1800,
-          models: PLANNER_MODELS,
-        });
-
-        for (const item of lookup.companies || []) {
-          const cleaned = cleanCompanyLookupRecord(item);
-          if (!cleaned) continue;
-          // Verify the returned slug against the claimed company name. No page
-          // title here, so this relies on the slug (drops ProfitIndustry -> iccg-usa).
-          if (
-            !companyEvidenceMatchesName(cleaned.company, cleaned.linkedin_id, '')
-          ) {
-            console.warn(
-              `  Dropping unverified company match: ${cleaned.company} -> ${cleaned.linkedin_id}`
-            );
-            continue;
-          }
-          const key = normalizedCompanyKey(cleaned.company);
-          if (key && !byCompany.has(key)) byCompany.set(key, cleaned);
-        }
-      } catch (error) {
-        console.warn(`  Company LinkedIn ID parser failed: ${error.message}`);
-      }
-    } else {
-      console.warn('  AI Mode company fallback returned no usable evidence.');
-    }
+      schema: COMPANY_ID_LOOKUP_SCHEMA,
+      maxTokens: 1800,
+      models: PLANNER_MODELS,
+    });
+  } catch (error) {
+    console.warn(`  Company LinkedIn ID parser failed: ${error.message}`);
+    return result;
   }
 
-  if (!byCompany.size) return normalizeExperienceForOutput(result);
+  const byCompany = new Map();
+  for (const item of lookup.companies || []) {
+    const cleaned = cleanCompanyLookupRecord(item);
+    if (!cleaned) continue;
+    const key = normalizedCompanyKey(cleaned.company);
+    if (key) byCompany.set(key, cleaned);
+  }
+
+  if (!byCompany.size) return result;
 
   const experience = (result.experience || []).map((item) => {
     const cleaned = cleanExperienceEntry(item);
@@ -2947,6 +2269,7 @@ ${trimText(aiModeResult, 20000)}
 
     return {
       ...cleaned,
+      company_url: cleaned.company_url || match.linkedin_url,
       company_linkedin_id: match.linkedin_id,
     };
   });
@@ -2960,9 +2283,7 @@ ${trimText(aiModeResult, 20000)}
     console.log(`  Filled ${filledCount} company LinkedIn IDs.`);
   }
 
-  // Final safety pass: deterministic resolvers can still pick a wrong linked
-  // page from noisy SERP/website evidence. Never let a mismatch reach output.
-  return normalizeExperienceForOutput(stripUnverifiedCompanyIds({ ...result, experience }));
+  return { ...result, experience };
 }
 
 function buildIdentityAnchor(scenario, profile) {
@@ -3054,6 +2375,36 @@ Return every role you can verify: company, title, location, start date, end
 date, duration, description, and source URL. Include old roles too.`,
     },
     {
+      label: 'experience_indexed_rows',
+      query: `${guardrail}
+
+Target LinkedIn profile:
+${linkedinUrl || name}
+
+Extract the indexed LinkedIn Experience section as structured rows. Search
+Google-indexed LinkedIn profile snippets and cached search snippets for this
+exact profile slug.
+
+Return 3-5 experience rows if visible. For each row include:
+- title
+- company
+- company LinkedIn URL if visible
+- company LinkedIn ID/slug if visible
+- location
+- start date
+- end date or Present
+- duration
+- description snippet
+- raw source URL
+
+Only use rows that appear as LinkedIn Experience entries. Do not create roles
+from posts, headline, creator bio, about text, hashtags, or general summaries.
+University organizations, campus cells, internships, and short production or
+operations roles can be included only if they appear as explicit experience
+rows with title/company/date or duration.
+If only headline/about is visible, return "experience rows not found".`,
+    },
+    {
       label: 'experience_full_web',
       query: `${guardrail}
 
@@ -3071,6 +2422,23 @@ Search exact-name career evidence:
 
 Find companies not visible in the public LinkedIn scrape. Return only roles
 that match this exact person.`,
+    },
+    {
+      label: 'experience_resume_cv_bio',
+      query: `${guardrail}
+
+Search for "${name}" resume OR CV OR biography OR bio OR "about" OR "profile".
+Extract all work experience, titles, dates, and descriptions from public pages.
+Return source URLs.`,
+    },
+    {
+      label: 'experience_role_keywords',
+      query: `${guardrail}
+
+Search "${name}" with role keywords that often appear in hidden LinkedIn
+experience: founder, co-founder, COO, chief, director, manager, business
+development, partnerships, revenue, analyst, intern, cashier, consultant,
+advisor. Return verified roles only.`,
     },
     {
       label: 'experience_social_bios',
@@ -3133,7 +2501,8 @@ as the strongest identity anchor and avoid same-name matches.`,
 
 function buildSparseLinkedInFallbackQueries(profile) {
   const linkedinUrl = profile.linkedin_url || '';
-  const profileId = resolveProfileId(profile);
+  const profileId =
+    profile.linkedin_public_identifier || getLinkedInProfileId(linkedinUrl);
   const name = profile.name || nameFromLinkedInProfileId(profileId) || profileId;
   const cleanUrl = linkedinUrl.replace(/\/?$/, '/');
 
@@ -3443,17 +2812,11 @@ async function collectResearch(scenario, profile) {
     return '';
   }
 
-  // Fast path: when the Profile API actually returned a full profile, the first
-  // pass already covers the experience section well. The planner second pass is
-  // a sequential extra round-trip, so skip it here unless explicitly enabled
-  // (or RESEARCH_MODE=deep). Recovered profiles (serp_reconstructed) and sparse
-  // private fallbacks intentionally fall through: the second pass is where most
-  // of their data comes from, which is exactly the failed-/profile-API case we
-  // want to enrich harder.
-  if (profile.profile_source === 'linkedin_api' && !EXPERIENCE_FOLLOWUP_ENABLED) {
+  // Real profile data already gives accurate experience, so skip the costly
+  // planner + second research wave unless explicitly enabled (or deep mode).
+  if (!EXPERIENCE_FOLLOWUP_ENABLED) {
     console.log(
-      '  Complete API profile: skipping planner follow-up pass (fast path). ' +
-        'Set EXPERIENCE_FOLLOWUP_ENABLED=true or RESEARCH_MODE=deep to re-enable.'
+      '  Skipping follow-up research pass (fast path; real profile experience is the source).'
     );
     return trimText(combined, MAX_TOTAL_RESEARCH_CHARS);
   }
@@ -3528,8 +2891,8 @@ Instructions:
 - The final experience array should be as complete as the evidence allows,
   including older roles and grouped sub-roles hidden from public LinkedIn.
 - For each experience entry, use the most specific title, company, location,
-  date range, duration, company_linkedin_id, and description supported by
-  baseline or research.
+  date range, duration, company_url, company_linkedin_id, and description
+  supported by baseline or research.
 - When only a company/title is verified but dates are not, include the role with
   null dates instead of dropping it.
 - Never include an experience entry with a null title. A company-only hint is
@@ -3553,9 +2916,9 @@ Instructions:
   confidence_score="low", avoid filling uncertain experience, and list missing
   fields instead of borrowing another person's data.
 - Build detailed experience descriptions only from supplied or sourced facts.
-- Do not include company_url in experience rows.
-- Set company_linkedin_id to null during synthesis. Verified company LinkedIn
-  IDs are resolved deterministically after synthesis.
+- Preserve company_url/company LinkedIn URLs and company_linkedin_id for
+  experience entries whenever present in baseline or research. Derive
+  company_linkedin_id from the LinkedIn company/school URL slug when possible.
 - Skills may be conservatively inferred from verified roles and activities.
 - Do not invent contact information, dates, URLs, education, or employers.
 - If contact research was disabled, keep email and phone null unless they were
@@ -3565,8 +2928,88 @@ Instructions:
 `.trim();
 }
 
-// Lightweight phase stopwatch: each call prints the time since the previous
-// call, so the console shows exactly where the run spends its seconds.
+// Print the full result to the console. Only write a file when OUTPUT_FILE is set.
+function emitResult(result) {
+  const json = JSON.stringify(result, null, 2);
+  console.log('\n===== RESULT (JSON) =====');
+  console.log(json);
+  if (OUTPUT_FILE) {
+    fs.writeFileSync(OUTPUT_FILE, json);
+    console.log(`\n(Also saved to ${OUTPUT_FILE})`);
+  }
+}
+
+// Deterministically guarantee the real LinkedIn profile's experience (roles +
+// descriptions) and summary survive synthesis. A fast synthesis model is quick
+// but can drop descriptions, whole roles, or the about text; this restores them
+// from ground truth so the experience section stays accurate and complete no
+// matter which model ran. No-op for sparse/failed-profile runs (no baseline).
+function preserveBaselineData(result, profile) {
+  const baseline = (profile.experience || [])
+    .map(cleanExperienceEntry)
+    .filter((entry) => entry.company && entry.title);
+
+  // Restore the real LinkedIn summary if synthesis left about empty.
+  let about = result.about;
+  if ((!about || !String(about).trim()) && profile.about) {
+    about = profile.about;
+  }
+
+  if (!baseline.length) {
+    return reconcileMissingFields({ ...result, about });
+  }
+
+  const keyOf = (entry) =>
+    `${normalizedText(entry.company)}|${normalizedText(entry.title)}`;
+  const resultExp = (result.experience || []).map(cleanExperienceEntry);
+  const byKey = new Map(resultExp.map((entry) => [keyOf(entry), entry]));
+  const used = new Set();
+  const merged = [];
+
+  // 1. Every real role survives, with ground-truth description/dates preferred.
+  for (const base of baseline) {
+    const key = keyOf(base);
+    used.add(key);
+    const match = byKey.get(key);
+    if (!match) {
+      merged.push(base);
+      continue;
+    }
+    merged.push({
+      ...match,
+      description: base.description || match.description,
+      start_date: match.start_date || base.start_date,
+      end_date: match.end_date || base.end_date,
+      location: match.location || base.location,
+      company_linkedin_id: match.company_linkedin_id || base.company_linkedin_id,
+    });
+  }
+
+  // 2. Keep any extra roles synthesis/research legitimately added.
+  for (const entry of resultExp) {
+    if (!used.has(keyOf(entry))) merged.push(entry);
+  }
+
+  return reconcileMissingFields({ ...result, about, experience: merged });
+}
+
+// Keep missing_fields honest after we restore about/experience deterministically.
+function reconcileMissingFields(result) {
+  if (!Array.isArray(result.missing_fields)) return result;
+  let missing = result.missing_fields;
+  if (result.about && String(result.about).trim()) {
+    missing = missing.filter((field) => field !== 'about');
+  }
+  if ((result.experience || []).length) {
+    missing = missing.filter(
+      (field) => field !== 'experience' && field !== 'current_role' && field !== 'current_company'
+    );
+  }
+  return { ...result, missing_fields: missing };
+}
+
+// Phase stopwatch: each call prints the time since the previous call, so every
+// run shows exactly where its seconds went (profile vs research vs synthesis).
 function phaseTimer() {
   let last = Date.now();
   return (label) => {
@@ -3611,33 +3054,27 @@ async function main() {
 
   mark('profile fetch / baseline');
 
-  // Resolve baseline company LinkedIn IDs concurrently with research so that
-  // work is off the post-synthesis critical path.
-  const [research, baselineCompanyIds] = await Promise.all([
-    collectResearch(SCENARIO, compact),
-    prefetchBaselineCompanyIds(compact),
-  ]);
+  const research = await collectResearch(SCENARIO, compact);
 
-  mark('research + company prefetch');
+  mark('research');
 
   if (
     isSparseLinkedInFallbackProfile(compact) &&
     !hasAcceptedPrivateProfileResearch(research, compact)
   ) {
     const result = buildProfileNotFoundResult(compact);
-    fs.writeFileSync(OUTPUT_FILE, JSON.stringify(result, null, 2));
 
     console.log(
       '  Identity verification failed. Returning profile_not_found before synthesis.'
     );
-    console.log(`\nDone. Result saved to ${OUTPUT_FILE}`);
+    emitResult(result);
+    console.log('\nDone.');
     console.log(`  Status: ${result.status}`);
     console.log(`  Error: ${result.error}`);
     console.log(`  Name: ${result.name || '-'}`);
     console.log(
       `  Calls: ${METRICS.linkedin_api_calls} LinkedIn, ` +
         `${METRICS.scrapingdog_ai_calls} AI Mode, ` +
-        `${METRICS.serp_calls} SERP, ` +
         `${METRICS.perplexity_search_calls} Perplexity, ` +
         `${METRICS.openrouter_search_calls} OpenRouter search, ` +
         `${METRICS.openrouter_calls} OpenRouter total`
@@ -3650,7 +3087,9 @@ async function main() {
 
   let prompt = buildSynthesisPrompt(SCENARIO, compact, research);
   let result = await callStructuredAI(prompt);
-  result = applyResultSanitizers(result, compact, research);
+  result = sanitizePrivateFallbackResult(result, compact, research);
+  result = sanitizePrivateFallbackExperience(result, compact, research);
+  result = sanitizeLowEvidenceBaselineResult(result, compact, research);
 
   mark('synthesis');
 
@@ -3665,22 +3104,23 @@ async function main() {
         .join('\n\n');
       prompt = buildSynthesisPrompt(SCENARIO, compact, rescuedResearch);
       result = await callStructuredAI(prompt);
-      result = applyResultSanitizers(result, compact, rescuedResearch);
+      result = sanitizePrivateFallbackResult(result, compact, rescuedResearch);
+      result = sanitizePrivateFallbackExperience(result, compact, rescuedResearch);
+      result = sanitizeLowEvidenceBaselineResult(result, compact, rescuedResearch);
     }
-    mark('experience rescue');
   }
 
-  result = await enrichExperienceCompanyLinkedInIds(
-    result,
-    compact,
-    baselineCompanyIds
-  );
+  // Guarantee the real profile's experience + descriptions + about survive,
+  // regardless of which (fast) synthesis model ran.
+  result = preserveBaselineData(result, compact);
 
-  mark('company id resolution');
+  result = await enrichExperienceCompanyLinkedInIds(result, compact);
 
-  fs.writeFileSync(OUTPUT_FILE, JSON.stringify(result, null, 2));
+  mark('rescue + company ids');
 
-  console.log(`\nDone. Result saved to ${OUTPUT_FILE}`);
+  emitResult(result);
+
+  console.log('\nDone.');
   console.log(`  Name: ${result.name || '-'}`);
   console.log(
     `  Role: ${result.current_role || '-'} @ ${result.current_company || '-'}`
@@ -3690,7 +3130,6 @@ async function main() {
   console.log(
     `  Calls: ${METRICS.linkedin_api_calls} LinkedIn, ` +
       `${METRICS.scrapingdog_ai_calls} AI Mode, ` +
-        `${METRICS.serp_calls} SERP, ` +
       `${METRICS.perplexity_search_calls} Perplexity, ` +
       `${METRICS.openrouter_search_calls} OpenRouter search, ` +
       `${METRICS.openrouter_calls} OpenRouter total`
@@ -3703,8 +3142,7 @@ async function main() {
 const RUN_STARTED_AT = Date.now();
 
 function logElapsed() {
-  const seconds = (Date.now() - RUN_STARTED_AT) / 1000;
-  console.log(`\nTotal time: ${seconds.toFixed(1)}s`);
+  console.log(`\nTotal time: ${((Date.now() - RUN_STARTED_AT) / 1000).toFixed(1)}s`);
 }
 
 main()
@@ -3716,4 +3154,4 @@ main()
     }
     logElapsed();
     process.exit(1);
-  });
+});
