@@ -17,8 +17,16 @@ const SCENARIO = Number(process.env.SCENARIO || 2);
 // rebuilt from less-accurate web research). Give it a real timeout so the scraped
 // profile is used when available. fresh=false uses Scrapingdog's cached scrape
 // (faster, same fields); set LINKEDIN_FRESH=true to force a live re-scrape.
-const LINKEDIN_TIMEOUT_MS = Number(process.env.LINKEDIN_TIMEOUT_MS || 30000);
+// A successful cached profile fetch returns in ~1-3s; if it takes much longer it
+// is hanging and will likely fail, so cap it tight to bound the worst case.
+const LINKEDIN_TIMEOUT_MS = Number(process.env.LINKEDIN_TIMEOUT_MS || 12000);
 const LINKEDIN_FRESH = process.env.LINKEDIN_FRESH === 'true';
+// Retry off by default: a retry on a hanging profile just doubles the wait
+// (12s -> 24s) and rarely recovers. Set LINKEDIN_PROFILE_RETRIES=1 if you prefer
+// resilience over speed.
+const LINKEDIN_PROFILE_RETRIES = Number(
+  process.env.LINKEDIN_PROFILE_RETRIES || 0
+);
 const LINKEDIN_PROFILE_FALLBACK =
   process.env.LINKEDIN_PROFILE_FALLBACK !== 'false';
 const PRIVATE_PROFILE_OPENAI_FALLBACK =
@@ -87,7 +95,11 @@ const EXPERIENCE_FOLLOWUP_ENABLED =
   process.env.EXPERIENCE_FOLLOWUP_ENABLED === 'true' ||
   (process.env.EXPERIENCE_FOLLOWUP_ENABLED !== 'false' &&
     RESEARCH_MODE === 'deep');
-const EXPERIENCE_RESCUE_ENABLED = process.env.EXPERIENCE_RESCUE_ENABLED !== 'false';
+// The experience rescue runs a full extra research + re-synthesis round when a
+// profile has few roles - the main cause of 40-50s spikes. Accurate experience
+// already comes from the real profile, so rescue is off by default for speed.
+// Set EXPERIENCE_RESCUE_ENABLED=true to re-enable hunting for hidden older roles.
+const EXPERIENCE_RESCUE_ENABLED = process.env.EXPERIENCE_RESCUE_ENABLED === 'true';
 const RESCUE_MIN_EXPERIENCE_COUNT = Number(
   process.env.RESCUE_MIN_EXPERIENCE_COUNT || 5
 );
@@ -146,6 +158,14 @@ const PLANNER_MODELS = envList(
 const MAX_ACTIVITIES = Number(process.env.MAX_ACTIVITIES || 8);
 const MAX_ACTIVITY_CHARS = Number(process.env.MAX_ACTIVITY_CHARS || 500);
 const MAX_RESEARCH_CHARS = Number(process.env.MAX_RESEARCH_CHARS || 10000);
+// Cap how many experience rows the synthesis model must (re)generate. The real
+// profile's full experience is restored deterministically afterward, so the model
+// only needs to handle the most recent roles (descriptions/about). This bounds
+// synthesis output/latency on rich profiles (e.g. 29 roles) without losing any
+// roles in the final result.
+const SYNTHESIS_EXPERIENCE_LIMIT = Number(
+  process.env.SYNTHESIS_EXPERIENCE_LIMIT || 12
+);
 // Synthesis latency scales with input size. Now that the real profile supplies
 // the accurate experience, research mainly adds the about text + a little
 // context, so it does not need to be huge. ~35k chars (~9k tokens) keeps the
@@ -550,6 +570,51 @@ function firstPresent(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== '') || null;
 }
 
+// Collapse newlines and repeated spaces into single spaces (LinkedIn scrapes are
+// full of ragged whitespace). Returns null for empty/blank input.
+function tidyText(value) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).replace(/\s+/g, ' ').trim();
+  return text || null;
+}
+
+// LinkedIn experience scrapes pack the role and company into one field separated
+// by a block of line breaks: "Position\n\n\nCompany". Fixes "position and company
+// in the same field" by splitting on the line breaks and taking the company
+// segment (independent of whether the job title matches), with a fallback that
+// strips a duplicated title prefix from an already-collapsed single string.
+function cleanCompanyName(rawCompany, title) {
+  if (rawCompany === null || rawCompany === undefined) return null;
+
+  // The line breaks are the real separator. Split on them, tidy each piece, and
+  // take the LAST non-empty segment — that is the company name.
+  const segments = String(rawCompany)
+    .split(/[\r\n]+/)
+    .map((segment) => segment.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  let company = segments.length
+    ? segments[segments.length - 1]
+    : tidyText(rawCompany);
+  if (!company) return null;
+
+  // Fallback: an already-collapsed single string that still begins with the job
+  // title (e.g. "Chairman and CEO Microsoft" with no line breaks left).
+  const cleanTitle = tidyText(title);
+  if (
+    cleanTitle &&
+    company.length > cleanTitle.length &&
+    company.toLowerCase().startsWith(cleanTitle.toLowerCase())
+  ) {
+    const stripped = company
+      .slice(cleanTitle.length)
+      .replace(/^[\s·,\-–|/@]+/, '')
+      .trim();
+    if (stripped) company = stripped;
+  }
+  return company || null;
+}
+
 function compactProfile(rawProfile, linkedinUrl = '') {
   const profile = firstObject(rawProfile);
   const experience = Array.isArray(profile.experience)
@@ -570,15 +635,18 @@ function compactProfile(rawProfile, linkedinUrl = '') {
         )
       );
 
+      const rawTitle = item.position || item.title || item.role || null;
+      const rawCompany =
+        item.company_name ||
+        item.company ||
+        item.companyName ||
+        item.organization ||
+        null;
+
       return {
-        company:
-          item.company_name ||
-          item.company ||
-          item.companyName ||
-          item.organization ||
-          null,
-        title: item.position || item.title || item.role || null,
-        location: item.location || null,
+        company: cleanCompanyName(rawCompany, rawTitle),
+        title: tidyText(rawTitle),
+        location: tidyText(item.location),
         start_date:
           item.start_date || item.starts_at || item.startDate || null,
         end_date: item.end_date || item.ends_at || item.endDate || null,
@@ -796,12 +864,12 @@ function cleanExperienceEntry(item) {
   );
 
   return {
-    company: item?.company || null,
-    title: item?.title || null,
-    location: item?.location || null,
-    start_date: item?.start_date || null,
-    end_date: item?.end_date || null,
-    description: item?.description || null,
+    company: cleanCompanyName(item?.company, item?.title),
+    title: tidyText(item?.title),
+    location: tidyText(item?.location),
+    start_date: tidyText(item?.start_date),
+    end_date: tidyText(item?.end_date),
+    description: tidyText(item?.description),
     company_url: companyUrl,
     company_linkedin_id:
       firstPresent(
@@ -2089,20 +2157,34 @@ function buildLinkedInFallbackProfile(linkedinUrl, reason) {
 }
 
 async function fetchLinkedInProfileOrFallback(linkedinUrl) {
-  try {
-    return compactProfile(await fetchLinkedInProfile(linkedinUrl), linkedinUrl);
-  } catch (error) {
-    METRICS.linkedin_api_failures += 1;
-
-    if (!LINKEDIN_PROFILE_FALLBACK) {
-      throw error;
+  // The Profile API is the ground-truth source for experience, so a transient
+  // failure is worth one quick retry before we drop to the weaker AI-Mode
+  // fallback (keeps random profiles from losing their experience section).
+  let lastError;
+  for (let attempt = 0; attempt <= LINKEDIN_PROFILE_RETRIES; attempt += 1) {
+    try {
+      return compactProfile(await fetchLinkedInProfile(linkedinUrl), linkedinUrl);
+    } catch (error) {
+      lastError = error;
+      if (attempt < LINKEDIN_PROFILE_RETRIES) {
+        console.warn(
+          `  LinkedIn profile API failed (attempt ${attempt + 1}), retrying: ${error.message}`
+        );
+        await sleep(600);
+      }
     }
-
-    console.warn(
-      `  LinkedIn profile API failed. Continuing with AI Mode fallback: ${error.message}`
-    );
-    return buildLinkedInFallbackProfile(linkedinUrl, error.message);
   }
+
+  METRICS.linkedin_api_failures += 1;
+
+  if (!LINKEDIN_PROFILE_FALLBACK) {
+    throw lastError;
+  }
+
+  console.warn(
+    `  LinkedIn profile API failed. Continuing with AI Mode fallback: ${lastError.message}`
+  );
+  return buildLinkedInFallbackProfile(linkedinUrl, lastError.message);
 }
 
 // ---------------------------------------------------------------------------
@@ -2870,6 +2952,21 @@ function buildSynthesisPrompt(scenario, profile, research) {
           ? 'ai_knowledge'
           : 'enriched';
 
+  // Only the most recent roles go to the model (it adds descriptions + about);
+  // the full experience list is restored deterministically after synthesis, so
+  // capping here bounds latency on very rich profiles without dropping roles.
+  const fullExperience = Array.isArray(profile.experience)
+    ? profile.experience
+    : [];
+  const trimmedProfile =
+    fullExperience.length > SYNTHESIS_EXPERIENCE_LIMIT
+      ? { ...profile, experience: fullExperience.slice(0, SYNTHESIS_EXPERIENCE_LIMIT) }
+      : profile;
+  const experienceNote =
+    fullExperience.length > SYNTHESIS_EXPERIENCE_LIMIT
+      ? `\nNote: only the ${SYNTHESIS_EXPERIENCE_LIMIT} most recent of ${fullExperience.length} roles are shown; older roles are retained automatically, so focus on these.`
+      : '';
+
   return `
 Create the final professional profile from the compact baseline and optional
 live research below.
@@ -2881,7 +2978,7 @@ Required data_source:
 ${sourceLabel}
 
 Baseline profile:
-${JSON.stringify(profile)}
+${JSON.stringify(trimmedProfile)}${experienceNote}
 
 Live research:
 ${research || 'No live research was performed.'}
@@ -2993,6 +3090,47 @@ function preserveBaselineData(result, profile) {
   return reconcileMissingFields({ ...result, about, experience: merged });
 }
 
+// Final pass: tidy every human-readable text field so the output is clean and
+// well-formatted (no leftover newlines / ragged whitespace from the scrape),
+// not just the company field.
+function formatProfileOutput(result) {
+  const cleanStrArray = (arr) =>
+    Array.isArray(arr) ? arr.map(tidyText).filter(Boolean) : arr;
+
+  const experience = Array.isArray(result.experience)
+    ? result.experience.map((entry) => ({
+        ...entry,
+        company: cleanCompanyName(entry.company, entry.title),
+        title: tidyText(entry.title),
+        location: tidyText(entry.location),
+        description: tidyText(entry.description),
+      }))
+    : result.experience;
+
+  const education = Array.isArray(result.education)
+    ? result.education.map((entry) => ({
+        ...entry,
+        institution: tidyText(entry.institution),
+        degree: tidyText(entry.degree),
+        field: tidyText(entry.field),
+      }))
+    : result.education;
+
+  return {
+    ...result,
+    name: tidyText(result.name),
+    headline: tidyText(result.headline),
+    current_company: tidyText(result.current_company),
+    current_role: tidyText(result.current_role),
+    location: tidyText(result.location),
+    about: tidyText(result.about),
+    experience,
+    education,
+    skills: cleanStrArray(result.skills),
+    languages: cleanStrArray(result.languages),
+  };
+}
+
 // Keep missing_fields honest after we restore about/experience deterministically.
 function reconcileMissingFields(result) {
   if (!Array.isArray(result.missing_fields)) return result;
@@ -3091,6 +3229,13 @@ async function main() {
   result = sanitizePrivateFallbackExperience(result, compact, research);
   result = sanitizeLowEvidenceBaselineResult(result, compact, research);
 
+  // Restore the real profile's experience BEFORE the rescue check. A fast model
+  // can emit fewer rows than the profile actually has; preserving first means the
+  // experience is already complete, so the costly rescue research + re-synthesis
+  // is correctly skipped for rich profiles (this was the ~40s spike on big
+  // profiles). Idempotent, so it runs again at the end for the rescue path.
+  result = preserveBaselineData(result, compact);
+
   mark('synthesis');
 
   if (
@@ -3115,6 +3260,9 @@ async function main() {
   result = preserveBaselineData(result, compact);
 
   result = await enrichExperienceCompanyLinkedInIds(result, compact);
+
+  // Final formatting pass so every text field is clean in the output.
+  result = formatProfileOutput(result);
 
   mark('rescue + company ids');
 
