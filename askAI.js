@@ -21,6 +21,17 @@ const SCENARIO = Number(process.env.SCENARIO || 2);
 // is hanging and will likely fail, so cap it tight to bound the worst case.
 const LINKEDIN_TIMEOUT_MS = Number(process.env.LINKEDIN_TIMEOUT_MS || 12000);
 const LINKEDIN_FRESH = process.env.LINKEDIN_FRESH === 'true';
+// Scrapingdog's standard scrape fails on some profiles with a 400
+// "Something went wrong. Try again or use premium=true." Many real profiles
+// (e.g. ones behind tougher anti-bot protection) only resolve with premium
+// proxies. 'auto' (default) tries standard first, then retries with premium on
+// failure — recovers those profiles while keeping the cheap path for the rest.
+// LINKEDIN_PREMIUM=always forces premium up-front; =never disables it.
+const LINKEDIN_PREMIUM = (process.env.LINKEDIN_PREMIUM || 'auto').toLowerCase();
+// How many times to attempt the premium scrape before giving up. Premium is the
+// reliable path, so a few retries with backoff make profile resolution robust
+// against one-off provider/network blips (the cause of sporadic profile_not_found).
+const LINKEDIN_PREMIUM_RETRIES = Number(process.env.LINKEDIN_PREMIUM_RETRIES || 3);
 // Retry off by default: a retry on a hanging profile just doubles the wait
 // (12s -> 24s) and rarely recovers. Set LINKEDIN_PROFILE_RETRIES=1 if you prefer
 // resilience over speed.
@@ -84,17 +95,15 @@ const PERPLEXITY_BATCH_SIZE = Number(
   process.env.PERPLEXITY_BATCH_SIZE || (RESEARCH_MODE === 'deep' ? 6 : 8)
 );
 const EXPERIENCE_FOLLOWUP_LIMIT = Number(
-  process.env.EXPERIENCE_FOLLOWUP_LIMIT || (RESEARCH_MODE === 'deep' ? 8 : 5)
+  process.env.EXPERIENCE_FOLLOWUP_LIMIT || (RESEARCH_MODE === 'deep' ? 12 : 8)
 );
-// The follow-up planning pass runs a planner LLM + a SECOND research wave to hunt
-// for hidden roles. That mattered when experience was rebuilt from scratch, but
-// now the real LinkedIn profile supplies the accurate experience, so the first
-// pass is enough. Default it to "deep" mode only (saves ~10s in standard).
-// Set EXPERIENCE_FOLLOWUP_ENABLED=true to force it on.
-const EXPERIENCE_FOLLOWUP_ENABLED =
-  process.env.EXPERIENCE_FOLLOWUP_ENABLED === 'true' ||
-  (process.env.EXPERIENCE_FOLLOWUP_ENABLED !== 'false' &&
-    RESEARCH_MODE === 'deep');
+// Auto-trigger the follow-up experience pass when LinkedIn API returned fewer
+// than this many roles. LinkedIn hides older roles behind sign-in, so a sparse
+// baseline (e.g. 3-5 roles for someone with 15+ companies) is the signal that
+// there are hidden roles to recover. Set to 0 to disable auto-trigger.
+const EXPERIENCE_FOLLOWUP_SPARSE_THRESHOLD = Number(
+  process.env.EXPERIENCE_FOLLOWUP_SPARSE_THRESHOLD || 6
+);
 // The experience rescue runs a full extra research + re-synthesis round when a
 // profile has few roles - the main cause of 40-50s spikes. Accurate experience
 // already comes from the real profile, so rescue is off by default for speed.
@@ -418,6 +427,45 @@ const EXPERIENCE_PLAN_SCHEMA = {
   required: ['likely_missing_roles', 'follow_up_queries'],
 };
 
+// Laser-focused company enumeration. Runs in parallel with full synthesis and
+// is prompted to do ONE thing well: list every employer clearly attributable to
+// the exact person. Catches companies the broader synthesis pass drops.
+const EXPERIENCE_EXTRACT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    companies: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          company: nullableString,
+          title: nullableString,
+          start_date: nullableString,
+          end_date: nullableString,
+          location: nullableString,
+          description: nullableString,
+          attribution_confidence: {
+            type: 'string',
+            enum: ['high', 'medium', 'low'],
+          },
+        },
+        required: [
+          'company',
+          'title',
+          'start_date',
+          'end_date',
+          'location',
+          'description',
+          'attribution_confidence',
+        ],
+      },
+    },
+  },
+  required: ['companies'],
+};
+
 const PRIVATE_PROFILE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -555,6 +603,9 @@ function normalizeLinkedInCompanyUrl(value) {
     return `https://www.linkedin.com/school/${schoolMatch[1]}`;
   }
 
+  // Reject person profile URLs — /in/ is a person, not a company page.
+  if (/linkedin\.com\/in\//i.test(raw)) return null;
+
   return raw;
 }
 
@@ -574,7 +625,17 @@ function firstPresent(...values) {
 // full of ragged whitespace). Returns null for empty/blank input.
 function tidyText(value) {
   if (value === null || value === undefined) return null;
-  const text = String(value).replace(/\s+/g, ' ').trim();
+  const text = String(value)
+    // Normalize unicode hyphen/dash variants to ASCII so compound words like
+    // "Full‑Stack" / "location‑aware" render consistently everywhere. A soft
+    // hyphen (U+00AD) between letters is the model's intent for a real hyphen.
+    .replace(/(?<=\w)­(?=\w)/g, '-')
+    .replace(/­/g, '')
+    .replace(/[‐‑‒–]/g, '-')
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
   return text || null;
 }
 
@@ -1045,8 +1106,6 @@ async function scrapingdogAI(query) {
       );
 
       const data = response.data || {};
-
-      console.log(data)
 
       const references = (data.references || [])
         .filter((item) => item.link)
@@ -1591,6 +1650,40 @@ async function perplexitySearch(query) {
   return openRouterResearch(query, PERPLEXITY_SEARCH_MODEL, 'Perplexity');
 }
 
+// Fetch a person's own website and return its visible text. The personal site is
+// the most authoritative public source for the employer list (it can't be
+// same-name confused), so this deterministic fetch reliably anchors companies
+// that the non-deterministic AI Mode / Perplexity passes sometimes miss.
+async function fetchWebsiteText(url) {
+  if (!url) return '';
+  const fullUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+  try {
+    const response = await axios.get(fullUrl, {
+      timeout: Number(process.env.WEBSITE_FETCH_TIMEOUT_MS || 8000),
+      maxRedirects: 5,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
+      },
+      responseType: 'text',
+    });
+    const html = String(response.data || '');
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      // Keep image alt text — company logos are often <img alt="eBay">.
+      .replace(/<img[^>]*\balt="([^"]*)"[^>]*>/gi, ' $1 ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&[a-z]+;/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return text;
+  } catch (error) {
+    console.warn(`  Website fetch failed (${fullUrl}): ${error.message}`);
+    return '';
+  }
+}
+
 async function perplexityBatchSearch(items, batchLabel) {
   const prompt = `
 Run one research pass that answers multiple career-history search angles.
@@ -1827,6 +1920,28 @@ function buildShortExperienceRescueQueries(profile, result) {
 function validExperienceCount(result) {
   return (result.experience || []).filter((item) => item.company && item.title)
     .length;
+}
+
+// Decide whether to run the expensive planner + second-wave follow-up pass.
+// Always off in RESEARCH_MODE=off. Otherwise: explicit env override wins;
+// deep mode always runs it; standard mode auto-enables when the LinkedIn API
+// returned fewer roles than the sparse threshold (LinkedIn hides old roles).
+function shouldRunExperienceFollowup(profile) {
+  if (process.env.EXPERIENCE_FOLLOWUP_ENABLED === 'false') return false;
+  if (RESEARCH_MODE === 'off') return false;
+  if (process.env.EXPERIENCE_FOLLOWUP_ENABLED === 'true') return true;
+  if (RESEARCH_MODE === 'deep') return true;
+  if (
+    EXPERIENCE_FOLLOWUP_SPARSE_THRESHOLD > 0 &&
+    profile?.profile_source === 'linkedin_api' &&
+    validExperienceCount(profile) < EXPERIENCE_FOLLOWUP_SPARSE_THRESHOLD
+  ) {
+    console.log(
+      `  LinkedIn API returned only ${validExperienceCount(profile)} role(s) — enabling follow-up pass to recover hidden older roles.`
+    );
+    return true;
+  }
+  return false;
 }
 
 function shouldRescueExperience(result, profile) {
@@ -2075,29 +2190,91 @@ async function runResearchQueries(items, startIndex = 0, profile = null) {
   );
 }
 
+async function callLinkedInApi(profileId, premium) {
+  METRICS.linkedin_api_calls += 1;
+  const response = await axios.get('https://api.scrapingdog.com/profile/', {
+    params: {
+      api_key: SCRAPINGDOG_KEY,
+      type: 'profile',
+      id: profileId,
+      fresh: LINKEDIN_FRESH ? 'true' : 'false',
+      ...(premium ? { premium: 'true' } : {}),
+    },
+    timeout: LINKEDIN_TIMEOUT_MS,
+  });
+
+  const data = response.data;
+  // Scrapingdog returns 200 with {success:false, message:"...premium=true"} on
+  // soft failures, so treat that as an error (not a valid profile).
+  if (!data || typeof data !== 'object') {
+    throw new Error('LinkedIn API returned an empty or invalid response');
+  }
+  const flat = Array.isArray(data) ? data[0] || {} : data;
+  if (flat.success === false || (flat.message && !flat.fullName && !flat.first_name)) {
+    throw new Error(`LinkedIn API soft failure: ${flat.message || 'unknown'}`);
+  }
+  return data;
+}
+
+// Premium scrape with its own retries. Premium is fast (~1s) and reliable, but a
+// single transient blip used to fall straight through to profile_not_found. We
+// retry it a few times with short backoff so a real profile is never lost to a
+// one-off network/provider hiccup.
+async function callLinkedInPremiumWithRetries(profileId) {
+  let lastError;
+  for (let attempt = 1; attempt <= LINKEDIN_PREMIUM_RETRIES; attempt += 1) {
+    try {
+      const raw = await callLinkedInApi(profileId, true);
+      console.log(
+        `  LinkedIn premium scrape succeeded${attempt > 1 ? ` (attempt ${attempt})` : ''}.`
+      );
+      return raw;
+    } catch (error) {
+      lastError = error;
+      console.warn(
+        `  LinkedIn premium scrape attempt ${attempt}/${LINKEDIN_PREMIUM_RETRIES} failed: ${error.message}`
+      );
+      if (attempt < LINKEDIN_PREMIUM_RETRIES) await sleep(700 * attempt);
+    }
+  }
+  throw lastError || new Error('LinkedIn premium scrape failed');
+}
+
 async function fetchLinkedInProfile(linkedinUrl) {
   const profileId = getLinkedInProfileId(linkedinUrl);
   if (!profileId) throw new Error(`Invalid LinkedIn URL: ${linkedinUrl}`);
 
-  METRICS.linkedin_api_calls += 1;
-  const response = await axios.get(
-    'https://api.scrapingdog.com/profile/',
-    {
-      params: {
-        api_key: SCRAPINGDOG_KEY,
-        type: 'profile',
-        id: profileId,
-        fresh: LINKEDIN_FRESH ? 'true' : 'false',
-      },
-      timeout: LINKEDIN_TIMEOUT_MS,
+  let raw;
+  if (LINKEDIN_PREMIUM === 'always') {
+    raw = await callLinkedInPremiumWithRetries(profileId);
+  } else {
+    try {
+      raw = await callLinkedInApi(profileId, false);
+    } catch (error) {
+      if (LINKEDIN_PREMIUM === 'never') throw error;
+      // Standard scrape failed — fall back to premium proxies (with retries),
+      // which is what Scrapingdog's error recommends and reliably recovers these.
+      console.warn(
+        `  LinkedIn standard scrape failed (${error.message}). Falling back to premium...`
+      );
+      raw = await callLinkedInPremiumWithRetries(profileId);
     }
-  );
-
-  if (!response.data || typeof response.data !== 'object') {
-    throw new Error('LinkedIn API returned an empty or invalid response');
   }
 
-  return response.data;
+  const obj = Array.isArray(raw) ? (raw[0] || {}) : raw;
+  const expKey = ['experience', 'positions', 'jobs', 'work', 'workHistory', 'work_history'].find(
+    (k) => Array.isArray(obj[k]) && obj[k].length > 0
+  );
+  if (expKey) {
+    const companyNames = obj[expKey]
+      .map((item) => item.company_name || item.company || '')
+      .filter((n) => n && !/^\*+$/.test(n));
+    console.log(
+      `  LinkedIn API: ${obj[expKey].length} experience item(s), companies: [${companyNames.join(', ')}]`
+    );
+  }
+
+  return raw;
 }
 
 function getLinkedInProfileId(linkedinUrl) {
@@ -2200,7 +2377,10 @@ function knownCompaniesFromProfile(profile, limit = 8) {
 function normalizedCompanyKey(value) {
   return normalizedText(value)
     .replace(/&/g, 'and')
-    .replace(/\b(pvt|private|limited|ltd|inc|llc|llp|corp|corporation|co)\b/g, '')
+    .replace(
+      /\b(pvt|private|limited|ltd|inc|llc|llp|corp|corporation|co|group|grupa|groupe|holding|holdings|gmbh|ag|sas|bv|oy|ab|as)\b/g,
+      ''
+    )
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
 }
@@ -2551,6 +2731,24 @@ experience facts only.`,
     },
   ];
 
+  // Personal website (if known) is the most reliable source for a complete bio.
+  const website = profile.website || '';
+  if (website) {
+    const domain = website.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    base.push({
+      label: 'experience_personal_website',
+      query: `${guardrail}
+
+Fetch career history from this person's personal website or blog:
+${website}
+
+Also search: site:${domain} OR "${domain}" experience about bio career
+
+Extract every company, job title, date range, and description mentioned.
+Return source URLs.`,
+    });
+  }
+
   for (const knownCompany of knownCompanies.slice(0, 8)) {
     base.push({
       label: `experience_company_${knownCompany}`,
@@ -2790,6 +2988,57 @@ function selectInitialResearchQueries(scenario, profile) {
   return [...baseExperience, ...companyRoleQueries];
 }
 
+// One-job extraction: enumerate every employer the research clearly attributes
+// to THIS person. Runs in parallel with full synthesis to recover companies the
+// broad synthesis pass drops (it juggles about/skills/education too and tends to
+// be conservative on the experience list). No added wall-clock — it overlaps.
+async function extractCareerFromResearch(profile, research) {
+  if (!research || !String(research).trim()) return [];
+
+  const signals = profileSignals(profile);
+  const knownCompanies = knownCompaniesFromProfile(profile, 12);
+
+  try {
+    const out = await callJsonAI({
+      label: 'experience_extract',
+      systemPrompt:
+        'You extract employment history from web research. You list ONLY companies clearly attributable to the exact person identified below. You never invent companies and never include directory/data-aggregator sites (RocketReach, Pappers, Stackforce, societe.com, Clutch, etc.) or businesses belonging to a different same-named person.',
+      userPrompt: `
+Exact person:
+- Name: ${signals.name || 'unknown'}
+- LinkedIn: ${signals.linkedin_url || 'unknown'}
+- Current/known company: ${signals.company || knownCompanies[0] || 'unknown'}
+- Location: ${signals.location || 'unknown'}
+- Known companies: ${knownCompanies.join(', ') || 'none'}
+
+Enumerate EVERY employer/role attributable to this exact person from the research
+below. Be thorough — include older roles, freelance, contract, and author/
+contributor roles (e.g. writing for a tech publication) if the research shows them.
+
+IMPORTANT: When a sentence lists multiple employers together — e.g. "Software
+Engineer at Toptal, eBay, Rakuten, and Ingenico" or "previous roles at X, Y and Z" —
+create a SEPARATE entry for EACH company named. Never collapse a comma/and list
+into one entry and never skip the middle items of such a list.
+
+For each company set attribution_confidence: "high" if a source ties it directly to
+this person (matching LinkedIn slug, GitHub, their site, or a clearly-this-person
+bio), "medium" if strongly implied, "low" if uncertain. Set fields to null when not
+stated. Do NOT include data-aggregator/directory sites as employers.
+
+Research:
+${trimText(research, 24000)}
+`.trim(),
+      schema: EXPERIENCE_EXTRACT_SCHEMA,
+      maxTokens: 2500,
+      models: PLANNER_MODELS,
+    });
+    return Array.isArray(out.companies) ? out.companies : [];
+  } catch (error) {
+    console.warn(`  Experience extraction failed: ${error.message}`);
+    return [];
+  }
+}
+
 async function planExperienceFollowups(scenario, profile, firstPassResearch) {
   if (!EXPERIENCE_FIRST || RESEARCH_MODE === 'off') {
     return { likely_missing_roles: [], follow_up_queries: [] };
@@ -2851,10 +3100,63 @@ Return:
   };
 }
 
+// Highest-signal AI Mode query labels — these surface LinkedIn-indexed rows
+// that Perplexity's general web search misses. When the Perplexity boost runs in
+// parallel (it covers timeline/github/press), we only need these from AI Mode,
+// trimming the initial wave to one concurrency batch and cutting wall-clock time.
+const AI_MODE_PRIORITY_LABELS = [
+  'linkedin_profile_recovery',
+  'experience_complete_breakdown',
+  'experience_linkedin_indexed',
+  'experience_indexed_rows',
+  'experience_personal_website',
+];
+
+// Hard latency cap per parallel boost call. perplexity/sonar usually returns in
+// 8-14s; a straggler past this is dropped so it can't dominate wall-clock time.
+const PERPLEXITY_BOOST_TIMEOUT_MS = Number(
+  process.env.PERPLEXITY_BOOST_TIMEOUT_MS || 14000
+);
+
+// Race a promise against a timeout; reject (not hang) when it overruns so the
+// caller's .catch() drops that single result and the run proceeds.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`timed out after ${(ms / 1000).toFixed(0)}s`)),
+      ms
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function collectResearch(scenario, profile) {
   if (RESEARCH_MODE === 'off') return '';
 
-  const queries = selectInitialResearchQueries(scenario, profile);
+  let queries = selectInitialResearchQueries(scenario, profile);
+
+  // When the Perplexity boost will run in parallel and the profile is sparse,
+  // trim the AI Mode wave to the highest-signal LinkedIn-indexed queries plus
+  // any per-company deep-dives. Everything else is redundant with the boost.
+  const willBoost =
+    shouldRunExperienceFollowup(profile) &&
+    SEARCH_FALLBACK.includes('perplexity') &&
+    RESEARCH_MODE !== 'deep' &&
+    process.env.AI_MODE_TRIM !== 'false';
+  if (willBoost && queries.length > AI_MODE_CONCURRENCY) {
+    const priority = queries.filter(
+      (q) =>
+        AI_MODE_PRIORITY_LABELS.includes(q.label) ||
+        q.label.startsWith('experience_company_')
+    );
+    if (priority.length) {
+      console.log(
+        `  Trimming AI Mode wave from ${queries.length} to ${priority.length} high-signal queries (Perplexity boost covers the rest).`
+      );
+      queries = priority;
+    }
+  }
 
   console.log(
     `  Running ${queries.length} focused research queries in parallel...`
@@ -2869,12 +3171,109 @@ async function collectResearch(scenario, profile) {
     `  Perplexity batch mode: ${PERPLEXITY_BATCH_MODE ? `on, size ${PERPLEXITY_BATCH_SIZE}` : 'off'}`
   );
 
-  const results = await runResearchQueries(queries, 0, profile);
+  // For sparse-baseline profiles, fire a Perplexity career overview IN PARALLEL
+  // with the AI Mode wave. Perplexity finishes in ~3-7s; AI Mode takes ~15-25s,
+  // so this adds zero wall-clock time while providing a reliable career anchor.
+  const usePerplexityBoost =
+    shouldRunExperienceFollowup(profile) && SEARCH_FALLBACK.includes('perplexity');
 
-  const combined = results
+  let perplexityBoostPromise = Promise.resolve(null);
+  if (usePerplexityBoost) {
+    const sig = profileSignals(profile);
+    const boostName = sig.name || 'unknown';
+    const boostUrl = sig.linkedin_url || boostName;
+    const boostAnchor = buildIdentityAnchor(scenario, profile);
+    // Three complementary angles. Running them as 3 PARALLEL single-angle calls
+    // (instead of one batch doing 3 sequential web searches) cuts latency from
+    // ~30s to the slowest single call (~12-15s) — the boost is the long pole.
+    const domain = (sig.linkedin_url || '')
+      .replace(/^https?:\/\//, '')
+      .replace(/\/.*$/, '');
+    // The timeline angle is the backbone (the full employer list), so it gets a
+    // longer leash. The supplementary angles are best-effort with a tighter cap.
+    const noiseGuard = `CRITICAL: Multiple different people may share this name. Only report roles for the SPECIFIC person at ${boostUrl} (a software/tech professional). EXCLUDE anything from business-registry or company-director databases (societe.com, societeinfo, pappers, infogreffe, etc.) and EXCLUDE local small businesses (rental/concierge, boat services, industrial SMEs) unless the LinkedIn profile, GitHub, or a reputable tech source explicitly confirms it. When unsure whether a company belongs to THIS person, omit it.`;
+    const boostItems = [
+      {
+        label: 'career_full_timeline',
+        timeout: PERPLEXITY_BOOST_TIMEOUT_MS + 2000,
+        query: `${noiseGuard}
+
+List the employers and roles ${boostName} (LinkedIn: ${boostUrl}) has held as a software/tech professional, most recent to oldest.
+For each: exact company name (use subsidiary names, e.g. "Rakuten Kobo" not "Rakuten"), job title, start date, end date or "Present", location, role description if explicitly stated.
+Include freelance, contract, and older tech roles. Return source URLs.`,
+      },
+      {
+        label: 'career_github_and_site',
+        timeout: PERPLEXITY_BOOST_TIMEOUT_MS,
+        query: `${noiseGuard}
+
+Search "${boostName}" on GitHub (pinned repos and bio) and on their personal website/blog About or CV page.
+List every employer or company mentioned, with role and dates if stated.
+Also check conference speaker bios (Devoxx, JSConf, ng-conf) for "${boostName}". Return source URLs.`,
+      },
+      {
+        label: 'career_press_and_mentions',
+        timeout: PERPLEXITY_BOOST_TIMEOUT_MS,
+        query: `${noiseGuard}
+
+Find press releases, interviews, news articles, or podcast appearances mentioning ${boostName} (${boostUrl}) as a tech professional.
+List every company or employer named, with the role or context. Return source URLs.`,
+      },
+    ];
+    console.log('  Starting 3 parallel Perplexity career-boost searches...');
+    perplexityBoostPromise = Promise.all(
+      boostItems.map((it) =>
+        withTimeout(
+          perplexitySearch(`${boostAnchor}\n\n${it.query}`),
+          it.timeout,
+          `boost ${it.label}`
+        )
+          .then((r) => (r ? `[${it.label}]\n${r}` : null))
+          .catch((err) => {
+            console.warn(`  Perplexity boost (${it.label}) ${err.message}`);
+            return null;
+          })
+      )
+    ).then((parts) => {
+      const merged = parts.filter(Boolean).join('\n\n');
+      return merged || null;
+    });
+  }
+
+  // Deterministically fetch the person's own website in parallel — it's the most
+  // authoritative public source for the employer list and can't be same-name
+  // confused. Runs alongside the AI Mode + boost waves, so no added wall-clock.
+  const websiteUrl = profile.website || '';
+  const websitePromise = websiteUrl
+    ? fetchWebsiteText(websiteUrl)
+    : Promise.resolve('');
+
+  const [results, perplexityBoost, websiteText] = await Promise.all([
+    runResearchQueries(queries, 0, profile),
+    perplexityBoostPromise,
+    websitePromise,
+  ]);
+
+  let combined = results
     .filter(({ result }) => result)
     .map(({ label, result }) => `[${label}]\n${result}`)
     .join('\n\n');
+
+  // Prepend the website text as a high-authority block (capped — it's raw HTML
+  // text). This guarantees website-listed employers are always in the evidence.
+  if (websiteText && websiteText.length > 80) {
+    console.log(
+      `  Fetched personal website (${websiteText.length} chars) — adding as authoritative source.`
+    );
+    combined = `[personal_website_direct] (AUTHORITATIVE — the person's own site: ${websiteUrl})\n${trimText(websiteText, 6000)}\n\n${combined}`;
+  }
+
+  let boostWasUseful = false;
+  if (perplexityBoost && isUsefulResearchResult(perplexityBoost)) {
+    console.log('  Perplexity career-boost returned useful data — prepending to research.');
+    combined = `[perplexity_career_boost]\n${perplexityBoost}\n\n${combined}`;
+    boostWasUseful = true;
+  }
 
   if (!EXPERIENCE_FIRST) {
     return trimText(combined, MAX_TOTAL_RESEARCH_CHARS);
@@ -2894,11 +3293,22 @@ async function collectResearch(scenario, profile) {
     return '';
   }
 
-  // Real profile data already gives accurate experience, so skip the costly
-  // planner + second research wave unless explicitly enabled (or deep mode).
-  if (!EXPERIENCE_FOLLOWUP_ENABLED) {
+  // Skip the planner + second research wave if the profile already has enough
+  // roles from the LinkedIn API, or if the env explicitly disables it.
+  if (!shouldRunExperienceFollowup(profile)) {
     console.log(
-      '  Skipping follow-up research pass (fast path; real profile experience is the source).'
+      '  Skipping follow-up research pass (baseline has enough roles or disabled).'
+    );
+    return trimText(combined, MAX_TOTAL_RESEARCH_CHARS);
+  }
+
+  // The Perplexity career-boost (3 angles) already covers the same ground the
+  // planner + AI Mode follow-up wave would — and it ran in parallel for free.
+  // When it returned useful data, skip the planner LLM call (~5s) and the
+  // follow-up AI Mode wave (~20-30s). This is the single biggest latency win.
+  if (boostWasUseful && process.env.EXPERIENCE_FOLLOWUP_FORCE !== 'true') {
+    console.log(
+      '  Perplexity career-boost covered follow-up needs — skipping planner + second AI Mode wave.'
     );
     return trimText(combined, MAX_TOTAL_RESEARCH_CHARS);
   }
@@ -2986,18 +3396,31 @@ ${research || 'No live research was performed.'}
 Instructions:
 - EXPERIENCE IS THE MOST IMPORTANT FIELD. Spend most of your effort there.
 - The final experience array should be as complete as the evidence allows,
-  including older roles and grouped sub-roles hidden from public LinkedIn.
+  including ALL companies mentioned in both the baseline and research. Do not
+  drop companies just because dates or descriptions are missing.
+- If the baseline experience array contains entries with a company name but null
+  title, those companies are LinkedIn-verified employers. Find their role in
+  research and include them in the experience section.
 - For each experience entry, use the most specific title, company, location,
   date range, duration, company_url, company_linkedin_id, and description
   supported by baseline or research.
+- Use the EXACT company name found in the research. If the research says
+  "Rakuten Kobo" use "Rakuten Kobo", not "Rakuten". If it says "Accenture
+  France" use "Accenture France", not "Accenture". Subsidiaries and brands
+  matter — do not generalize to parent companies.
 - When only a company/title is verified but dates are not, include the role with
   null dates instead of dropping it.
 - Never include an experience entry with a null title. A company-only hint is
   not an experience record.
 - Never add duplicate company-only entries when a detailed role already exists
   for that company.
-- Never write descriptions with phrases like "likely involved", "probably",
-  or "may have". If responsibilities are not sourced, set description to null.
+- Never write speculative, hedged, or generic descriptions. Prohibited
+  words/phrases: "likely", "probably", "possibly", "may have", "might have",
+  "appears to", "seems to", "could have", "presumably", "implies", "suggests",
+  "likely involved", "likely worked", "contributed to projects".
+  A description must quote or closely paraphrase a specific fact stated in
+  the research text. If no such specific fact exists, set description to null.
+  Do NOT rephrase general knowledge or restate the job title.
 - Do not collapse multiple roles at the same company if the evidence supports
   separate titles or promotions.
 - Preserve all verified baseline facts.
@@ -3041,6 +3464,151 @@ function emitResult(result) {
 // but can drop descriptions, whole roles, or the about text; this restores them
 // from ground truth so the experience section stays accurate and complete no
 // matter which model ran. No-op for sparse/failed-profile runs (no baseline).
+// Deterministic anti-hallucination guard. A fast synthesis model occasionally
+// invents a company (e.g. "Disruptive Synergies LLC") with a fabricated
+// LinkedIn slug. Drop any experience entry whose company name appears NOWHERE
+// in the research evidence or the LinkedIn baseline — those are inventions, not
+// findings. Baseline-verified companies are always kept.
+function dropHallucinatedCompanies(result, profile, research) {
+  if (!Array.isArray(result.experience) || !result.experience.length) {
+    return result;
+  }
+
+  const evidence = normalizedText(`${research || ''} ${profile.about || ''}`);
+  const baselineKeys = new Set(
+    (profile.experience || [])
+      .map((e) => normalizedCompanyKey(e.company))
+      .filter(Boolean)
+  );
+
+  // Directory/ranking/aggregator sites a profile gets LISTED on — never real
+  // employers. Synthesis sometimes mistakes "company X is ranked on Y" for a job.
+  const NON_EMPLOYER_PATTERN =
+    /(\btop\s+\d*\s*(interactive\s+)?(agenc|compan|developer|firm)|\bbest\s+\w+\s+(agenc|compan)|\b(clutch|goodfirms|designrush|crunchbase|rocketreach|pappers|societe|stackforce|glassdoor|indeed|trustpilot|directory|ranking|listicle)\b)/i;
+  // Placeholder/junk company names a model emits when it has no real value.
+  const JUNK_COMPANY_PATTERN =
+    /^(unspecified|unknown|undisclosed|various|n\/?a|none|not\s+(specified|available|found)|company|employer|self[\s-]?employed|freelance|independent)\b/i;
+
+  const kept = [];
+  const dropped = [];
+  for (const entry of result.experience) {
+    const company = entry.company || '';
+    const key = normalizedCompanyKey(company);
+    // Keep if it's a baseline-verified employer.
+    if (key && baselineKeys.has(key)) {
+      kept.push(entry);
+      continue;
+    }
+    // Drop obvious directory/ranking sites and junk placeholder names.
+    if (NON_EMPLOYER_PATTERN.test(company) || JUNK_COMPANY_PATTERN.test(company.trim())) {
+      dropped.push(company);
+      continue;
+    }
+    // Keep if the company name (or its core token) appears in the evidence text.
+    const core = key.split(' ')[0] || '';
+    const appears =
+      (company && evidence.includes(normalizedText(company))) ||
+      (key && evidence.includes(key)) ||
+      (core.length >= 4 && evidence.includes(core));
+    if (appears) {
+      kept.push(entry);
+    } else {
+      dropped.push(company);
+    }
+  }
+
+  if (dropped.length) {
+    console.log(
+      `  Dropped ${dropped.length} unverifiable (hallucinated) compan${dropped.length === 1 ? 'y' : 'ies'}: [${dropped.join(', ')}]`
+    );
+  }
+
+  const finalExp = kept.length ? kept : result.experience;
+
+  // Dedup by company (synthesis can emit the same employer twice under slightly
+  // different titles, e.g. "Co-Founder" + "CEO"). Merge into the richest entry.
+  const fieldScore = (e) =>
+    ['title', 'description', 'start_date', 'end_date', 'location', 'company_url', 'company_linkedin_id']
+      .filter((f) => e[f]).length;
+  const byCompany = new Map();
+  for (const entry of finalExp) {
+    const key = normalizedCompanyKey(entry.company);
+    if (!key) {
+      byCompany.set(Symbol(), entry); // keep unkeyed entries as-is
+      continue;
+    }
+    const existing = byCompany.get(key);
+    if (!existing) {
+      byCompany.set(key, entry);
+      continue;
+    }
+    // Merge: prefer the richer entry, backfill missing fields from the other.
+    const [rich, lean] =
+      fieldScore(entry) >= fieldScore(existing) ? [entry, existing] : [existing, entry];
+    byCompany.set(key, {
+      ...rich,
+      description: rich.description || lean.description,
+      start_date: rich.start_date || lean.start_date,
+      end_date: rich.end_date || lean.end_date,
+      location: rich.location || lean.location,
+      company_url: rich.company_url || lean.company_url,
+      company_linkedin_id: rich.company_linkedin_id || lean.company_linkedin_id,
+    });
+  }
+
+  const deduped = Array.from(byCompany.values());
+  if (deduped.length < finalExp.length) {
+    console.log(
+      `  Merged ${finalExp.length - deduped.length} duplicate company entr${finalExp.length - deduped.length === 1 ? 'y' : 'ies'}.`
+    );
+    if (process.env.DEBUG_DEDUP) {
+      console.log(
+        `  [debug] before: [${finalExp.map((e) => e.company).join(', ')}]`
+      );
+      console.log(
+        `  [debug] after:  [${deduped.map((e) => e.company).join(', ')}]`
+      );
+    }
+  }
+
+  return { ...result, experience: deduped };
+}
+
+// Union extracted companies into the synthesized experience. The focused
+// extraction pass is more thorough at enumeration, so it recovers companies the
+// broad synthesis dropped. Only entries with a title and decent attribution are
+// added; existing companies are left untouched (synthesis descriptions win).
+function mergeExtractedCompanies(result, extracted) {
+  if (!Array.isArray(extracted) || !extracted.length) return result;
+
+  const experience = Array.isArray(result.experience) ? [...result.experience] : [];
+  const existingKeys = new Set(
+    experience.map((e) => normalizedCompanyKey(e.company)).filter(Boolean)
+  );
+
+  const JUNK = /^(unspecified|unknown|undisclosed|various|n\/?a|none|not\s+(specified|available|found)|company|employer)\b/i;
+  const added = [];
+  for (const item of extracted) {
+    const entry = cleanExperienceEntry(item);
+    if (!entry.company || !entry.title) continue; // need a real role
+    if (JUNK.test(entry.company.trim())) continue; // placeholder junk
+    if ((item.attribution_confidence || 'low') === 'low') continue; // too risky
+    const key = normalizedCompanyKey(entry.company);
+    if (!key || existingKeys.has(key)) continue;
+    existingKeys.add(key);
+    experience.push(entry);
+    added.push(entry.company);
+  }
+
+  if (added.length) {
+    console.log(
+      `  Recovered ${added.length} compan${added.length === 1 ? 'y' : 'ies'} from focused extraction: [${added.join(', ')}]`
+    );
+  }
+
+  return { ...result, experience };
+}
+
 function preserveBaselineData(result, profile) {
   const baseline = (profile.experience || [])
     .map(cleanExperienceEntry)
@@ -3087,6 +3655,28 @@ function preserveBaselineData(result, profile) {
     if (!used.has(keyOf(entry))) merged.push(entry);
   }
 
+  // 3. Company-only LinkedIn API entries (title=null) are verified employers.
+  //    They can't anchor a full role but their company_url/linkedin_id are
+  //    authoritative — backfill those fields into any matching merged entry.
+  const companyAnchors = (profile.experience || [])
+    .map(cleanExperienceEntry)
+    .filter((e) => e.company && !e.title && (e.company_url || e.company_linkedin_id));
+
+  if (companyAnchors.length) {
+    const anchorByKey = new Map(
+      companyAnchors.map((a) => [normalizedCompanyKey(a.company), a])
+    );
+    for (let i = 0; i < merged.length; i++) {
+      const anchor = anchorByKey.get(normalizedCompanyKey(merged[i].company));
+      if (!anchor) continue;
+      merged[i] = {
+        ...merged[i],
+        company_url: merged[i].company_url || anchor.company_url,
+        company_linkedin_id: merged[i].company_linkedin_id || anchor.company_linkedin_id,
+      };
+    }
+  }
+
   return reconcileMissingFields({ ...result, about, experience: merged });
 }
 
@@ -3097,14 +3687,20 @@ function formatProfileOutput(result) {
   const cleanStrArray = (arr) =>
     Array.isArray(arr) ? arr.map(tidyText).filter(Boolean) : arr;
 
+  const HEDGE_PATTERN =
+    /\b(likely|probably|possibly|may have|might have|appears to|seems to|could have|presumably|implies|implied|suggests|suggesting|likely involved|likely worked|contributed to projects)\b/i;
+
   const experience = Array.isArray(result.experience)
-    ? result.experience.map((entry) => ({
-        ...entry,
-        company: cleanCompanyName(entry.company, entry.title),
-        title: tidyText(entry.title),
-        location: tidyText(entry.location),
-        description: tidyText(entry.description),
-      }))
+    ? result.experience.map((entry) => {
+        const desc = tidyText(entry.description);
+        return {
+          ...entry,
+          company: cleanCompanyName(entry.company, entry.title),
+          title: tidyText(entry.title),
+          location: tidyText(entry.location),
+          description: desc && HEDGE_PATTERN.test(desc) ? null : desc,
+        };
+      })
     : result.experience;
 
   const education = Array.isArray(result.education)
@@ -3190,9 +3786,19 @@ async function main() {
     throw new Error('SCENARIO must be 1, 2, or 3');
   }
 
+  const baselineRoles = validExperienceCount(compact);
+  console.log(
+    `  Baseline: ${compact.profile_source || 'n/a'}, ${baselineRoles} experience role(s)`
+  );
+
   mark('profile fetch / baseline');
 
   const research = await collectResearch(SCENARIO, compact);
+
+  if (process.env.DUMP_RESEARCH) {
+    fs.writeFileSync(process.env.DUMP_RESEARCH, research || '');
+    console.log(`  [debug] research dumped to ${process.env.DUMP_RESEARCH}`);
+  }
 
   mark('research');
 
@@ -3223,8 +3829,17 @@ async function main() {
     return;
   }
 
+  // Run full synthesis and the focused company-extraction pass concurrently so
+  // the extra completeness costs ~0 wall-clock time (extraction overlaps).
   let prompt = buildSynthesisPrompt(SCENARIO, compact, research);
+  const extractPromise = extractCareerFromResearch(compact, research);
   let result = await callStructuredAI(prompt);
+  const extractedCompanies = await extractPromise;
+  if (process.env.DEBUG_EXTRACT) {
+    console.log(
+      `  [debug] extracted: ${JSON.stringify(extractedCompanies.map((c) => `${c.company} (${c.attribution_confidence})`))}`
+    );
+  }
   result = sanitizePrivateFallbackResult(result, compact, research);
   result = sanitizePrivateFallbackExperience(result, compact, research);
   result = sanitizeLowEvidenceBaselineResult(result, compact, research);
@@ -3258,6 +3873,12 @@ async function main() {
   // Guarantee the real profile's experience + descriptions + about survive,
   // regardless of which (fast) synthesis model ran.
   result = preserveBaselineData(result, compact);
+
+  // Union in any company the focused extraction found that synthesis dropped.
+  result = mergeExtractedCompanies(result, extractedCompanies);
+
+  // Remove any company the model invented (not in research or baseline).
+  result = dropHallucinatedCompanies(result, compact, research);
 
   result = await enrichExperienceCompanyLinkedInIds(result, compact);
 
