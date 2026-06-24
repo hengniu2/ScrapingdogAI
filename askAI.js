@@ -32,6 +32,11 @@ const LINKEDIN_PREMIUM = (process.env.LINKEDIN_PREMIUM || 'auto').toLowerCase();
 // reliable path, so a few retries with backoff make profile resolution robust
 // against one-off provider/network blips (the cause of sporadic profile_not_found).
 const LINKEDIN_PREMIUM_RETRIES = Number(process.env.LINKEDIN_PREMIUM_RETRIES || 3);
+// A no-anchor profile (no company from the API) with at least this many
+// followers is treated as a public figure whose career research is reliable, so
+// we still research it. Below this, a no-anchor profile is deemed unverifiable
+// (same-name risk) and we skip research + return baseline only.
+const PROMINENCE_FOLLOWERS = Number(process.env.PROMINENCE_FOLLOWERS || 10000);
 // Retry off by default: a retry on a hanging profile just doubles the wait
 // (12s -> 24s) and rarely recovers. Set LINKEDIN_PROFILE_RETRIES=1 if you prefer
 // resilience over speed.
@@ -941,7 +946,7 @@ function cleanExperienceEntry(item) {
   };
 }
 
-function normalizeAndValidateProfileResult(result) {
+function normalizeAndValidateProfileResult(result, allowEmptyExperience = false) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) {
     throw new Error('profile result is not an object');
   }
@@ -958,7 +963,10 @@ function normalizeAndValidateProfileResult(result) {
     .map(cleanExperienceEntry)
     .filter((item) => item.company && item.title);
 
-  if (!result.experience.length) {
+  // Normally an empty experience array means the model returned a degenerate
+  // response, so we throw to trigger a retry on the next model. But for genuinely
+  // sparse profiles (private/no public experience) empty is the correct answer.
+  if (!result.experience.length && !allowEmptyExperience) {
     throw new Error('profile result has no valid experience entries');
   }
 
@@ -976,7 +984,7 @@ function normalizeAndValidateProfileResult(result) {
   return result;
 }
 
-async function callStructuredAI(userPrompt) {
+async function callStructuredAI(userPrompt, allowEmptyExperience = false) {
   let lastError;
 
   for (const model of SYNTHESIS_MODELS) {
@@ -1021,7 +1029,10 @@ async function callStructuredAI(userPrompt) {
 
       printUsage(`Synthesis via ${model}`, response.data);
       const content = response.data?.choices?.[0]?.message?.content || '{}';
-      return normalizeAndValidateProfileResult(JSON.parse(content));
+      return normalizeAndValidateProfileResult(
+        JSON.parse(content),
+        allowEmptyExperience
+      );
     } catch (error) {
       lastError = error;
       console.warn(`  Synthesis model ${model} failed: ${error.message}`);
@@ -3117,6 +3128,14 @@ const AI_MODE_PRIORITY_LABELS = [
 const PERPLEXITY_BOOST_TIMEOUT_MS = Number(
   process.env.PERPLEXITY_BOOST_TIMEOUT_MS || 14000
 );
+// Each Perplexity boost angle is a paid sonar call (~$0.006) and is ~93% of the
+// per-run OpenRouter cost. Default to 1 (the high-value timeline angle) to keep
+// cost low; the supplementary github/press angles mostly added cost + same-name
+// noise. Bump PERPLEXITY_BOOST_ANGLES to 2-3 if you want broader recall.
+const PERPLEXITY_BOOST_ANGLES = Math.max(
+  1,
+  Math.min(3, Number(process.env.PERPLEXITY_BOOST_ANGLES || 1))
+);
 
 // Race a promise against a timeout; reject (not hang) when it overruns so the
 // caller's .catch() drops that single result and the run proceeds.
@@ -3133,6 +3152,18 @@ function withTimeout(promise, ms, label) {
 
 async function collectResearch(scenario, profile) {
   if (RESEARCH_MODE === 'off') return '';
+
+  // Unverifiable no-anchor profiles (private, low-profile, common-name): public
+  // research returns a DIFFERENT same-named person each run and we discard it
+  // anyway (gateSameNameExperience). Skip the whole research phase — it's wasted
+  // OpenRouter spend and time. Prominent public figures are exempt (researched
+  // normally); ALLOW_UNANCHORED_EXPERIENCE=true forces research for anyone.
+  if (scenario === 2 && isUnverifiableNoAnchorProfile(profile)) {
+    console.log(
+      '  No company anchor + low profile — skipping research (would be discarded as unverifiable same-name data). Returns baseline + low confidence.'
+    );
+    return '';
+  }
 
   let queries = selectInitialResearchQueries(scenario, profile);
 
@@ -3189,38 +3220,52 @@ async function collectResearch(scenario, profile) {
     const domain = (sig.linkedin_url || '')
       .replace(/^https?:\/\//, '')
       .replace(/\/.*$/, '');
+    // Identity descriptor built from the ACTUAL profile (role/headline/company/
+    // location), not a hardcoded industry — works for any field (tech, finance,
+    // wealth planning, etc.) and sharpens same-name disambiguation.
+    const personBits = [
+      sig.role ? `role: ${sig.role}` : '',
+      sig.company ? `company: ${sig.company}` : '',
+      sig.location ? `location: ${sig.location}` : '',
+    ].filter(Boolean);
+    const personDescriptor = personBits.length
+      ? ` (${personBits.join('; ')})`
+      : '';
+
     // The timeline angle is the backbone (the full employer list), so it gets a
     // longer leash. The supplementary angles are best-effort with a tighter cap.
-    const noiseGuard = `CRITICAL: Multiple different people may share this name. Only report roles for the SPECIFIC person at ${boostUrl} (a software/tech professional). EXCLUDE anything from business-registry or company-director databases (societe.com, societeinfo, pappers, infogreffe, etc.) and EXCLUDE local small businesses (rental/concierge, boat services, industrial SMEs) unless the LinkedIn profile, GitHub, or a reputable tech source explicitly confirms it. When unsure whether a company belongs to THIS person, omit it.`;
-    const boostItems = [
+    const noiseGuard = `CRITICAL: Multiple different people may share the name "${boostName}". Only report roles for the SPECIFIC person at ${boostUrl}${personDescriptor}. Match identity using the LinkedIn URL, current company, and location. EXCLUDE anything from business-registry or company-director databases (societe.com, pappers, infogreffe, rocketreach, zoominfo, etc.) and EXCLUDE businesses that don't match this person's actual field/location. When unsure whether a company belongs to THIS exact person, OMIT it — a missing company is far better than a wrong one.`;
+    const allBoostItems = [
       {
         label: 'career_full_timeline',
         timeout: PERPLEXITY_BOOST_TIMEOUT_MS + 2000,
         query: `${noiseGuard}
 
-List the employers and roles ${boostName} (LinkedIn: ${boostUrl}) has held as a software/tech professional, most recent to oldest.
-For each: exact company name (use subsidiary names, e.g. "Rakuten Kobo" not "Rakuten"), job title, start date, end date or "Present", location, role description if explicitly stated.
-Include freelance, contract, and older tech roles. Return source URLs.`,
+List the employers and roles ${boostName}${personDescriptor} (LinkedIn: ${boostUrl}) has held, most recent to oldest.
+For each: exact company name (use subsidiary/brand names where applicable), job title, start date, end date or "Present", location, role description if explicitly stated.
+Include freelance, contract, and older roles. Return source URLs.`,
       },
       {
         label: 'career_github_and_site',
         timeout: PERPLEXITY_BOOST_TIMEOUT_MS,
         query: `${noiseGuard}
 
-Search "${boostName}" on GitHub (pinned repos and bio) and on their personal website/blog About or CV page.
-List every employer or company mentioned, with role and dates if stated.
-Also check conference speaker bios (Devoxx, JSConf, ng-conf) for "${boostName}". Return source URLs.`,
+Search "${boostName}" on their personal website/blog/CV page, GitHub, and professional bios.
+List every employer or company mentioned, with role and dates if stated. Return source URLs.`,
       },
       {
         label: 'career_press_and_mentions',
         timeout: PERPLEXITY_BOOST_TIMEOUT_MS,
         query: `${noiseGuard}
 
-Find press releases, interviews, news articles, or podcast appearances mentioning ${boostName} (${boostUrl}) as a tech professional.
+Find press releases, interviews, news articles, or podcast appearances mentioning ${boostName}${personDescriptor} (${boostUrl}).
 List every company or employer named, with the role or context. Return source URLs.`,
       },
     ];
-    console.log('  Starting 3 parallel Perplexity career-boost searches...');
+    const boostItems = allBoostItems.slice(0, PERPLEXITY_BOOST_ANGLES);
+    console.log(
+      `  Starting ${boostItems.length} parallel Perplexity career-boost search(es)...`
+    );
     perplexityBoostPromise = Promise.all(
       boostItems.map((it) =>
         withTimeout(
@@ -3463,6 +3508,77 @@ function emitResult(result) {
 // descriptions) and summary survive synthesis. A fast synthesis model is quick
 // but can drop descriptions, whole roles, or the about text; this restores them
 // from ground truth so the experience section stays accurate and complete no
+// True when the LinkedIn baseline gives at least one real company name to anchor
+// identity. Empty/censored companies (private profiles) don't count.
+function hasBaselineCompanyAnchor(profile) {
+  return (profile.experience || []).some(
+    (e) => e.company && String(e.company).trim() && !/^\*+$/.test(e.company)
+  );
+}
+
+// Parse a LinkedIn follower/connection string ("56K followers", "1,205", "2M")
+// into a number.
+function parseSocialCount(value) {
+  if (!value) return 0;
+  const m = String(value).match(/([\d][\d.,]*)\s*([KkMm])?/);
+  if (!m) return 0;
+  const n = parseFloat(m[1].replace(/,/g, ''));
+  if (Number.isNaN(n)) return 0;
+  const suffix = (m[2] || '').toLowerCase();
+  return Math.round(n * (suffix === 'm' ? 1e6 : suffix === 'k' ? 1e3 : 1));
+}
+
+// A profile with no company anchor is risky for same-name contamination. But a
+// PROMINENT person (many followers) is a public figure whose career research
+// reliably identifies the right person (e.g. a government minister), so we still
+// research them. Only low-profile, no-anchor, private profiles are unverifiable.
+function isUnverifiableNoAnchorProfile(profile) {
+  if (hasBaselineCompanyAnchor(profile)) return false;
+  if (process.env.ALLOW_UNANCHORED_EXPERIENCE === 'true') return false;
+  if (parseSocialCount(profile.followers) >= PROMINENCE_FOLLOWERS) return false;
+  return true;
+}
+
+// Identity gate for same-name contamination. Common-name private profiles (no
+// company anchor, e.g. "Aaron Smith" in a small village) make web research pull
+// in a DIFFERENT, more-prominent same-named person's employers — and a different
+// stranger each run. We cannot verify identity from public data here (the search
+// providers even echo the name/location we pass them), so the honest default is
+// to NOT show unverifiable experience: keep only baseline-anchored companies and
+// mark confidence low. Set ALLOW_UNANCHORED_EXPERIENCE=true to keep best-effort
+// guesses (clearly low-confidence) instead.
+function gateSameNameExperience(result, profile, research) {
+  if (hasBaselineCompanyAnchor(profile)) return result; // anchored — trust pipeline
+  // No anchor but prominent/opted-in: research is reliable enough to keep, but
+  // still mark low confidence since there's no baseline company to verify against.
+  if (!isUnverifiableNoAnchorProfile(profile)) {
+    return { ...result, confidence_score: 'low' };
+  }
+
+  const baselineKeys = new Set(
+    (profile.experience || [])
+      .map((e) => normalizedCompanyKey(e.company))
+      .filter(Boolean)
+  );
+  const exp = Array.isArray(result.experience) ? result.experience : [];
+  const safe = exp.filter((e) => baselineKeys.has(normalizedCompanyKey(e.company)));
+  if (safe.length < exp.length) {
+    console.log(
+      `  No baseline company anchor + common-name risk — dropping ${exp.length - safe.length} unverifiable same-name compan${exp.length - safe.length === 1 ? 'y' : 'ies'} (can't confirm it's this exact person). Set ALLOW_UNANCHORED_EXPERIENCE=true to keep best-effort guesses.`
+    );
+  }
+  const missing =
+    !safe.length && Array.isArray(result.missing_fields)
+      ? Array.from(new Set([...result.missing_fields, 'experience']))
+      : result.missing_fields;
+  return {
+    ...result,
+    experience: safe,
+    confidence_score: 'low',
+    missing_fields: missing,
+  };
+}
+
 // matter which model ran. No-op for sparse/failed-profile runs (no baseline).
 // Deterministic anti-hallucination guard. A fast synthesis model occasionally
 // invents a company (e.g. "Disruptive Synergies LLC") with a fabricated
@@ -3487,7 +3603,7 @@ function dropHallucinatedCompanies(result, profile, research) {
     /(\btop\s+\d*\s*(interactive\s+)?(agenc|compan|developer|firm)|\bbest\s+\w+\s+(agenc|compan)|\b(clutch|goodfirms|designrush|crunchbase|rocketreach|pappers|societe|stackforce|glassdoor|indeed|trustpilot|directory|ranking|listicle)\b)/i;
   // Placeholder/junk company names a model emits when it has no real value.
   const JUNK_COMPANY_PATTERN =
-    /^(unspecified|unknown|undisclosed|various|n\/?a|none|not\s+(specified|available|found)|company|employer|self[\s-]?employed|freelance|independent)\b/i;
+    /^(unspecified|unknown|undisclosed|various|n\/?a|none|not\s+(specified|available|found)|company|employer|self[\s-]?employed|freelance|independent|auto[\s-]?entrepreneur|auto[\s-]?entrepreneurship)\b/i;
 
   const kept = [];
   const dropped = [];
@@ -3829,11 +3945,16 @@ async function main() {
     return;
   }
 
+  // Sparse profiles (no baseline company + no research) legitimately yield an
+  // empty experience array — allow it instead of erroring out.
+  const allowEmpty =
+    SCENARIO === 2 && !hasBaselineCompanyAnchor(compact) && !research;
+
   // Run full synthesis and the focused company-extraction pass concurrently so
   // the extra completeness costs ~0 wall-clock time (extraction overlaps).
   let prompt = buildSynthesisPrompt(SCENARIO, compact, research);
   const extractPromise = extractCareerFromResearch(compact, research);
-  let result = await callStructuredAI(prompt);
+  let result = await callStructuredAI(prompt, allowEmpty);
   const extractedCompanies = await extractPromise;
   if (process.env.DEBUG_EXTRACT) {
     console.log(
@@ -3879,6 +4000,9 @@ async function main() {
 
   // Remove any company the model invented (not in research or baseline).
   result = dropHallucinatedCompanies(result, compact, research);
+
+  // Drop same-name contamination for common-name profiles with no anchor.
+  result = gateSameNameExperience(result, compact, research);
 
   result = await enrichExperienceCompanyLinkedInIds(result, compact);
 
