@@ -21,22 +21,19 @@ const SCENARIO = Number(process.env.SCENARIO || 2);
 // is hanging and will likely fail, so cap it tight to bound the worst case.
 const LINKEDIN_TIMEOUT_MS = Number(process.env.LINKEDIN_TIMEOUT_MS || 12000);
 const LINKEDIN_FRESH = process.env.LINKEDIN_FRESH === 'true';
-// Scrapingdog's standard scrape fails on some profiles with a 400
-// "Something went wrong. Try again or use premium=true." Many real profiles
-// (e.g. ones behind tougher anti-bot protection) only resolve with premium
-// proxies. 'auto' (default) tries standard first, then retries with premium on
-// failure — recovers those profiles while keeping the cheap path for the rest.
-// LINKEDIN_PREMIUM=always forces premium up-front; =never disables it.
-const LINKEDIN_PREMIUM = (process.env.LINKEDIN_PREMIUM || 'auto').toLowerCase();
+// Scrapingdog's standard scrape randomly fails with 400 "use premium=true";
+// premium resolves those reliably. The /profile API must be called only ONCE per
+// profile (client requirement), so the default is 'always' = a single premium
+// call (one HTTP request, no fallback). 'auto' tries standard then premium on
+// failure (TWO calls — avoid if you need exactly one). 'never' = standard only.
+const LINKEDIN_PREMIUM = (process.env.LINKEDIN_PREMIUM || 'always').toLowerCase();
 // How many times to attempt the premium scrape before giving up. Premium is the
 // reliable path, so a few retries with backoff make profile resolution robust
 // against one-off provider/network blips (the cause of sporadic profile_not_found).
-const LINKEDIN_PREMIUM_RETRIES = Number(process.env.LINKEDIN_PREMIUM_RETRIES || 3);
-// A no-anchor profile (no company from the API) with at least this many
-// followers is treated as a public figure whose career research is reliable, so
-// we still research it. Below this, a no-anchor profile is deemed unverifiable
-// (same-name risk) and we skip research + return baseline only.
-const PROMINENCE_FOLLOWERS = Number(process.env.PROMINENCE_FOLLOWERS || 10000);
+// IMPORTANT: the /profile API must be called only ONCE per profile (client
+// requirement — no retries, no standard+premium double calls). Default 1 = a
+// single attempt. Only raise this if you explicitly accept extra billed calls.
+const LINKEDIN_PREMIUM_RETRIES = Number(process.env.LINKEDIN_PREMIUM_RETRIES || 1);
 // Retry off by default: a retry on a hanging profile just doubles the wait
 // (12s -> 24s) and rarely recovers. Set LINKEDIN_PROFILE_RETRIES=1 if you prefer
 // resilience over speed.
@@ -65,7 +62,12 @@ const EXPERIENCE_FIRST = process.env.EXPERIENCE_FIRST !== 'false';
 // "deep"     -> standard research plus per-company and alternate-anchor queries
 const RESEARCH_MODE = process.env.RESEARCH_MODE || 'standard';
 
-const SEARCH_FALLBACK = process.env.SEARCH_FALLBACK || 'perplexity';
+// Paid web-search fallback (Perplexity) that re-runs queries when AI Mode results
+// look weak. Testing showed it ONLY fired on hard/no-anchor profiles and there
+// added cost (~$0.006/run) WITHOUT improving completeness — the AI Mode wave
+// already covered them. Default 'none' (no paid fallback). Set to 'perplexity'
+// to re-enable the recovery safety net at higher cost.
+const SEARCH_FALLBACK = process.env.SEARCH_FALLBACK || 'none';
 const PERPLEXITY_SEARCH_MODEL =
   process.env.PERPLEXITY_SEARCH_MODEL || 'perplexity/sonar';
 const OPENROUTER_SEARCH_MODEL =
@@ -85,7 +87,7 @@ const AI_MODE_RETRIES = Number(process.env.AI_MODE_RETRIES || 0);
 const AI_MODE_RETRY_DELAY_MS = Number(
   process.env.AI_MODE_RETRY_DELAY_MS || 800
 );
-const AI_MODE_TIMEOUT_MS = Number(process.env.AI_MODE_TIMEOUT_MS || 18000);
+const AI_MODE_TIMEOUT_MS = Number(process.env.AI_MODE_TIMEOUT_MS || 12000);
 // The paid web-search fallback (Perplexity/OpenRouter) fires after the AI Mode
 // wave when results look weak, and it ran with a 90s timeout -> the occasional
 // 35s+ research spike. Cap it so it can never blow the time budget.
@@ -102,12 +104,13 @@ const PERPLEXITY_BATCH_SIZE = Number(
 const EXPERIENCE_FOLLOWUP_LIMIT = Number(
   process.env.EXPERIENCE_FOLLOWUP_LIMIT || (RESEARCH_MODE === 'deep' ? 12 : 8)
 );
-// Auto-trigger the follow-up experience pass when LinkedIn API returned fewer
-// than this many roles. LinkedIn hides older roles behind sign-in, so a sparse
-// baseline (e.g. 3-5 roles for someone with 15+ companies) is the signal that
-// there are hidden roles to recover. Set to 0 to disable auto-trigger.
+// Auto-trigger the follow-up experience pass (planner + a 2nd AI Mode wave) when
+// the LinkedIn API returned fewer than this many roles. DISABLED by default (0):
+// testing showed the full first-pass AI Mode wave + the focused extraction pass
+// already recover the same companies, so the 2nd wave added ~12s and ~$0.0025
+// for ZERO extra companies. Raise it (e.g. 6) only if you want the deep 2nd wave.
 const EXPERIENCE_FOLLOWUP_SPARSE_THRESHOLD = Number(
-  process.env.EXPERIENCE_FOLLOWUP_SPARSE_THRESHOLD || 6
+  process.env.EXPERIENCE_FOLLOWUP_SPARSE_THRESHOLD || 0
 );
 // The experience rescue runs a full extra research + re-synthesis round when a
 // profile has few roles - the main cause of 40-50s spikes. Accurate experience
@@ -430,6 +433,23 @@ const EXPERIENCE_PLAN_SCHEMA = {
     },
   },
   required: ['likely_missing_roles', 'follow_up_queries'],
+};
+
+// Same-name confusion detector for no-anchor profiles. A common name (e.g.
+// "Aaron Smith") with no baseline company makes research describe MULTIPLE
+// different people; a rare name (e.g. "Laura Krivuneca") describes one coherent
+// person. The LLM reads the raw research and decides which.
+const IDENTITY_COHERENCE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    verdict: {
+      type: 'string',
+      enum: ['one_person', 'multiple_same_name_people', 'insufficient_evidence'],
+    },
+    reason: nullableString,
+  },
+  required: ['verdict', 'reason'],
 };
 
 // Laser-focused company enumeration. Runs in parallel with full synthesis and
@@ -2201,28 +2221,55 @@ async function runResearchQueries(items, startIndex = 0, profile = null) {
   );
 }
 
+// Recognize Scrapingdog account/billing errors (quota exhausted, invalid key,
+// plan limit) so they're reported clearly instead of being mistaken for a
+// missing profile. These are NOT recoverable by retrying or by web fallback.
+function isQuotaOrAuthMessage(msg) {
+  return /free pack|calls only|upgrade|quota|limit reached|exceeded|invalid api key|unauthorized|payment|subscription/i.test(
+    String(msg || '')
+  );
+}
+
+function markQuotaError(message) {
+  const err = new Error(`Scrapingdog account/quota error: ${message}`);
+  err.isQuotaError = true;
+  return err;
+}
+
 async function callLinkedInApi(profileId, premium) {
   METRICS.linkedin_api_calls += 1;
-  const response = await axios.get('https://api.scrapingdog.com/profile/', {
-    params: {
-      api_key: SCRAPINGDOG_KEY,
-      type: 'profile',
-      id: profileId,
-      fresh: LINKEDIN_FRESH ? 'true' : 'false',
-      ...(premium ? { premium: 'true' } : {}),
-    },
-    timeout: LINKEDIN_TIMEOUT_MS,
-  });
+  let response;
+  try {
+    response = await axios.get('https://api.scrapingdog.com/profile/', {
+      params: {
+        api_key: SCRAPINGDOG_KEY,
+        type: 'profile',
+        id: profileId,
+        fresh: LINKEDIN_FRESH ? 'true' : 'false',
+        ...(premium ? { premium: 'true' } : {}),
+      },
+      timeout: LINKEDIN_TIMEOUT_MS,
+    });
+  } catch (error) {
+    // HTTP-level errors (403 quota, 401 bad key, 402 payment) carry a message.
+    const apiMsg = error.response?.data?.message || error.response?.data?.error;
+    if (error.response && (error.response.status === 403 || error.response.status === 401 || error.response.status === 402 || isQuotaOrAuthMessage(apiMsg))) {
+      throw markQuotaError(apiMsg || `HTTP ${error.response.status}`);
+    }
+    throw error;
+  }
 
   const data = response.data;
-  // Scrapingdog returns 200 with {success:false, message:"...premium=true"} on
-  // soft failures, so treat that as an error (not a valid profile).
   if (!data || typeof data !== 'object') {
     throw new Error('LinkedIn API returned an empty or invalid response');
   }
   const flat = Array.isArray(data) ? data[0] || {} : data;
+  // Scrapingdog also returns 200 with {success:false, message:"..."} on soft
+  // failures — including quota messages — so detect those here too.
   if (flat.success === false || (flat.message && !flat.fullName && !flat.first_name)) {
-    throw new Error(`LinkedIn API soft failure: ${flat.message || 'unknown'}`);
+    const msg = flat.message || 'unknown';
+    if (isQuotaOrAuthMessage(msg)) throw markQuotaError(msg);
+    throw new Error(`LinkedIn API soft failure: ${msg}`);
   }
   return data;
 }
@@ -2242,6 +2289,8 @@ async function callLinkedInPremiumWithRetries(profileId) {
       return raw;
     } catch (error) {
       lastError = error;
+      // Quota/billing/auth errors won't fix themselves on retry — fail fast.
+      if (error.isQuotaError) throw error;
       console.warn(
         `  LinkedIn premium scrape attempt ${attempt}/${LINKEDIN_PREMIUM_RETRIES} failed: ${error.message}`
       );
@@ -2354,6 +2403,9 @@ async function fetchLinkedInProfileOrFallback(linkedinUrl) {
       return compactProfile(await fetchLinkedInProfile(linkedinUrl), linkedinUrl);
     } catch (error) {
       lastError = error;
+      // A quota/billing/auth error is an account problem, not a missing profile.
+      // Don't disguise it as a sparse fallback — stop and report it clearly.
+      if (error.isQuotaError) throw error;
       if (attempt < LINKEDIN_PROFILE_RETRIES) {
         console.warn(
           `  LinkedIn profile API failed (attempt ${attempt + 1}), retrying: ${error.message}`
@@ -3050,6 +3102,47 @@ ${trimText(research, 24000)}
   }
 }
 
+// For no-anchor profiles, judge whether the COMPANIES attributed to the person
+// plausibly belong to ONE individual or to MULTIPLE different same-named people.
+// The company-list scatter is a sharp signal: a single person isn't a game-host
+// AND a removals firm AND a police force. A rare name (Laura Krivuneca) yields a
+// coherent list; a common name (Aaron Smith) yields obvious cross-industry junk.
+async function judgeIdentityCoherence(profile, companies) {
+  const list = (companies || [])
+    .map((c) => `- ${c.company}${c.title ? ` — ${c.title}` : ''}${c.location ? ` (${c.location})` : ''}`)
+    .filter(Boolean);
+  if (list.length < 2) {
+    return { verdict: 'insufficient_evidence', reason: 'too few companies to judge' };
+  }
+  const sig = profileSignals(profile);
+  try {
+    return await callJsonAI({
+      label: 'identity_coherence',
+      systemPrompt:
+        'You detect same-name confusion. Common names (e.g. "Aaron Smith") collide across many unrelated real people; web research then mixes their employers together. Given a target person and the companies research attributed to them, decide if those companies form ONE plausible career for a SINGLE person, or whether they obviously belong to DIFFERENT people who merely share the name.',
+      userPrompt: `Target person:
+- Name: ${sig.name || 'unknown'}
+- Location: ${sig.location || 'unknown'}
+
+Companies attributed by research:
+${list.join('\n')}
+
+Decide:
+- "one_person": the companies form a believable single career (related fields, or a sensible progression, consistent region).
+- "multiple_same_name_people": the companies clearly span unrelated industries/roles that no single person would hold together (e.g. a video-game host AND a furniture-removals firm AND a police constabulary) — classic common-name collision.
+- "insufficient_evidence": genuinely can't tell.
+
+Be decisive: if the list looks like 3+ unrelated walks of life, choose multiple_same_name_people.`,
+      schema: IDENTITY_COHERENCE_SCHEMA,
+      maxTokens: 400,
+      models: PLANNER_MODELS,
+    });
+  } catch (error) {
+    console.warn(`  Identity coherence check failed: ${error.message}`);
+    return { verdict: 'one_person', reason: 'check failed — keeping (fail-open)' };
+  }
+}
+
 async function planExperienceFollowups(scenario, profile, firstPassResearch) {
   if (!EXPERIENCE_FIRST || RESEARCH_MODE === 'off') {
     return { likely_missing_roles: [], follow_up_queries: [] };
@@ -3128,13 +3221,14 @@ const AI_MODE_PRIORITY_LABELS = [
 const PERPLEXITY_BOOST_TIMEOUT_MS = Number(
   process.env.PERPLEXITY_BOOST_TIMEOUT_MS || 14000
 );
-// Each Perplexity boost angle is a paid sonar call (~$0.006) and is ~93% of the
-// per-run OpenRouter cost. Default to 1 (the high-value timeline angle) to keep
-// cost low; the supplementary github/press angles mostly added cost + same-name
-// noise. Bump PERPLEXITY_BOOST_ANGLES to 2-3 if you want broader recall.
+// Each Perplexity boost angle is a paid sonar call (~$0.006) and was the bulk of
+// per-run OpenRouter cost. Testing showed the AI Mode wave (Scrapingdog credits,
+// not OpenRouter $) alone gives EQUAL OR BETTER completeness at ~half the cost,
+// so the default is 0 (no paid boost). 1 = add the timeline angle; 2-3 = broader
+// recall at higher OpenRouter cost.
 const PERPLEXITY_BOOST_ANGLES = Math.max(
-  1,
-  Math.min(3, Number(process.env.PERPLEXITY_BOOST_ANGLES || 1))
+  0,
+  Math.min(3, Number(process.env.PERPLEXITY_BOOST_ANGLES || 0))
 );
 
 // Race a promise against a timeout; reject (not hang) when it overruns so the
@@ -3153,29 +3247,19 @@ function withTimeout(promise, ms, label) {
 async function collectResearch(scenario, profile) {
   if (RESEARCH_MODE === 'off') return '';
 
-  // Unverifiable no-anchor profiles (private, low-profile, common-name): public
-  // research returns a DIFFERENT same-named person each run and we discard it
-  // anyway (gateSameNameExperience). Skip the whole research phase — it's wasted
-  // OpenRouter spend and time. Prominent public figures are exempt (researched
-  // normally); ALLOW_UNANCHORED_EXPERIENCE=true forces research for anyone.
-  if (scenario === 2 && isUnverifiableNoAnchorProfile(profile)) {
-    console.log(
-      '  No company anchor + low profile — skipping research (would be discarded as unverifiable same-name data). Returns baseline + low confidence.'
-    );
-    return '';
-  }
-
   let queries = selectInitialResearchQueries(scenario, profile);
 
-  // When the Perplexity boost will run in parallel and the profile is sparse,
-  // trim the AI Mode wave to the highest-signal LinkedIn-indexed queries plus
-  // any per-company deep-dives. Everything else is redundant with the boost.
-  const willBoost =
-    shouldRunExperienceFollowup(profile) &&
-    SEARCH_FALLBACK.includes('perplexity') &&
+  // Trim the AI Mode wave to the highest-signal LinkedIn-indexed queries plus any
+  // per-company deep-dives. The broad fallback queries (full_web, resume, social,
+  // news, role_keywords, location) rarely add companies the priority queries miss
+  // but they DO add latency (each is a separate AI Mode call, capped at 18s) and
+  // weak results that trigger paid Perplexity fallbacks. One concurrency batch of
+  // high-signal queries is the speed/cost sweet spot. AI_MODE_TRIM=false disables.
+  if (
     RESEARCH_MODE !== 'deep' &&
-    process.env.AI_MODE_TRIM !== 'false';
-  if (willBoost && queries.length > AI_MODE_CONCURRENCY) {
+    process.env.AI_MODE_TRIM !== 'false' &&
+    queries.length > AI_MODE_CONCURRENCY
+  ) {
     const priority = queries.filter(
       (q) =>
         AI_MODE_PRIORITY_LABELS.includes(q.label) ||
@@ -3183,7 +3267,7 @@ async function collectResearch(scenario, profile) {
     );
     if (priority.length) {
       console.log(
-        `  Trimming AI Mode wave from ${queries.length} to ${priority.length} high-signal queries (Perplexity boost covers the rest).`
+        `  Trimming AI Mode wave from ${queries.length} to ${priority.length} high-signal queries.`
       );
       queries = priority;
     }
@@ -3206,7 +3290,9 @@ async function collectResearch(scenario, profile) {
   // with the AI Mode wave. Perplexity finishes in ~3-7s; AI Mode takes ~15-25s,
   // so this adds zero wall-clock time while providing a reliable career anchor.
   const usePerplexityBoost =
-    shouldRunExperienceFollowup(profile) && SEARCH_FALLBACK.includes('perplexity');
+    PERPLEXITY_BOOST_ANGLES > 0 &&
+    shouldRunExperienceFollowup(profile) &&
+    SEARCH_FALLBACK.includes('perplexity');
 
   let perplexityBoostPromise = Promise.resolve(null);
   if (usePerplexityBoost) {
@@ -3336,6 +3422,18 @@ List every company or employer named, with the role or context. Return source UR
       '  No anchored private-profile evidence found. Skipping follow-up planning.'
     );
     return '';
+  }
+
+  // No-anchor profiles can't be identity-verified, so a deep second research
+  // wave just spends more chasing an unconfirmable person (and a common name
+  // gets dropped later anyway). The first AI Mode wave is enough to (a) find a
+  // rare-name person's companies and (b) let the coherence judge decide. Skip
+  // the planner + second wave to cap their cost.
+  if (!hasBaselineCompanyAnchor(profile)) {
+    console.log(
+      '  No baseline company anchor — skipping deep follow-up wave (caps cost; first-pass research + coherence judge decide).'
+    );
+    return trimText(combined, MAX_TOTAL_RESEARCH_CHARS);
   }
 
   // Skip the planner + second research wave if the profile already has enough
@@ -3516,64 +3614,39 @@ function hasBaselineCompanyAnchor(profile) {
   );
 }
 
-// Parse a LinkedIn follower/connection string ("56K followers", "1,205", "2M")
-// into a number.
-function parseSocialCount(value) {
-  if (!value) return 0;
-  const m = String(value).match(/([\d][\d.,]*)\s*([KkMm])?/);
-  if (!m) return 0;
-  const n = parseFloat(m[1].replace(/,/g, ''));
-  if (Number.isNaN(n)) return 0;
-  const suffix = (m[2] || '').toLowerCase();
-  return Math.round(n * (suffix === 'm' ? 1e6 : suffix === 'k' ? 1e3 : 1));
-}
 
-// A profile with no company anchor is risky for same-name contamination. But a
-// PROMINENT person (many followers) is a public figure whose career research
-// reliably identifies the right person (e.g. a government minister), so we still
-// research them. Only low-profile, no-anchor, private profiles are unverifiable.
-function isUnverifiableNoAnchorProfile(profile) {
-  if (hasBaselineCompanyAnchor(profile)) return false;
-  if (process.env.ALLOW_UNANCHORED_EXPERIENCE === 'true') return false;
-  if (parseSocialCount(profile.followers) >= PROMINENCE_FOLLOWERS) return false;
-  return true;
-}
-
-// Identity gate for same-name contamination. Common-name private profiles (no
-// company anchor, e.g. "Aaron Smith" in a small village) make web research pull
-// in a DIFFERENT, more-prominent same-named person's employers — and a different
-// stranger each run. We cannot verify identity from public data here (the search
-// providers even echo the name/location we pass them), so the honest default is
-// to NOT show unverifiable experience: keep only baseline-anchored companies and
-// mark confidence low. Set ALLOW_UNANCHORED_EXPERIENCE=true to keep best-effort
-// guesses (clearly low-confidence) instead.
-function gateSameNameExperience(result, profile, research) {
+// Identity gate for same-name contamination. For profiles WITH a baseline
+// company anchor, trust the pipeline. For NO-anchor profiles we can't verify
+// identity from the baseline, so we ask judgeIdentityCoherence whether the raw
+// research describes ONE coherent person (keep — e.g. rare name "Laura
+// Krivuneca") or MULTIPLE same-named people (drop — e.g. common name "Aaron
+// Smith"). Either way, no-anchor profiles are marked low confidence.
+// ALLOW_UNANCHORED_EXPERIENCE=true keeps experience without the coherence check.
+async function gateSameNameExperience(result, profile, research) {
   if (hasBaselineCompanyAnchor(profile)) return result; // anchored — trust pipeline
-  // No anchor but prominent/opted-in: research is reliable enough to keep, but
-  // still mark low confidence since there's no baseline company to verify against.
-  if (!isUnverifiableNoAnchorProfile(profile)) {
+
+  const exp = Array.isArray(result.experience) ? result.experience : [];
+  if (!exp.length) return { ...result, confidence_score: 'low' };
+  if (process.env.ALLOW_UNANCHORED_EXPERIENCE === 'true') {
     return { ...result, confidence_score: 'low' };
   }
 
-  const baselineKeys = new Set(
-    (profile.experience || [])
-      .map((e) => normalizedCompanyKey(e.company))
-      .filter(Boolean)
-  );
-  const exp = Array.isArray(result.experience) ? result.experience : [];
-  const safe = exp.filter((e) => baselineKeys.has(normalizedCompanyKey(e.company)));
-  if (safe.length < exp.length) {
-    console.log(
-      `  No baseline company anchor + common-name risk — dropping ${exp.length - safe.length} unverifiable same-name compan${exp.length - safe.length === 1 ? 'y' : 'ies'} (can't confirm it's this exact person). Set ALLOW_UNANCHORED_EXPERIENCE=true to keep best-effort guesses.`
-    );
+  const judgment = await judgeIdentityCoherence(profile, exp);
+  if (judgment.verdict !== 'multiple_same_name_people') {
+    // one_person or insufficient_evidence -> keep (rare-name profiles like Laura
+    // resolve to one_person and keep their real companies), but low confidence.
+    return { ...result, confidence_score: 'low' };
   }
-  const missing =
-    !safe.length && Array.isArray(result.missing_fields)
-      ? Array.from(new Set([...result.missing_fields, 'experience']))
-      : result.missing_fields;
+
+  console.log(
+    `  Same-name confusion detected — dropping ${exp.length} unverifiable compan${exp.length === 1 ? 'y' : 'ies'} (research describes multiple different people sharing this name${judgment.reason ? `: ${judgment.reason}` : ''}). Set ALLOW_UNANCHORED_EXPERIENCE=true to keep them.`
+  );
+  const missing = Array.isArray(result.missing_fields)
+    ? Array.from(new Set([...result.missing_fields, 'experience']))
+    : ['experience'];
   return {
     ...result,
-    experience: safe,
+    experience: [],
     confidence_score: 'low',
     missing_fields: missing,
   };
@@ -3945,10 +4018,10 @@ async function main() {
     return;
   }
 
-  // Sparse profiles (no baseline company + no research) legitimately yield an
-  // empty experience array — allow it instead of erroring out.
-  const allowEmpty =
-    SCENARIO === 2 && !hasBaselineCompanyAnchor(compact) && !research;
+  // No-anchor profiles can legitimately yield an empty experience array (private
+  // profile, or same-name research dropped by the gate) — allow it instead of
+  // erroring out. Anchored profiles still retry on empty (model-failure guard).
+  const allowEmpty = SCENARIO === 2 && !hasBaselineCompanyAnchor(compact);
 
   // Run full synthesis and the focused company-extraction pass concurrently so
   // the extra completeness costs ~0 wall-clock time (extraction overlaps).
@@ -4002,7 +4075,7 @@ async function main() {
   result = dropHallucinatedCompanies(result, compact, research);
 
   // Drop same-name contamination for common-name profiles with no anchor.
-  result = gateSameNameExperience(result, compact, research);
+  result = await gateSameNameExperience(result, compact, research);
 
   result = await enrichExperienceCompanyLinkedInIds(result, compact);
 
@@ -4041,6 +4114,18 @@ function logElapsed() {
 main()
   .then(logElapsed)
   .catch((error) => {
+    if (error.isQuotaError) {
+      console.error(
+        `\n=================== SCRAPINGDOG ACCOUNT LIMIT ===================\n` +
+          `${error.message}\n` +
+          `This is NOT a code error and NOT a missing profile — the LinkedIn\n` +
+          `/profile API rejected the request due to your plan's quota/billing.\n` +
+          `Fix: upgrade the Scrapingdog plan or use a key with remaining credits.\n` +
+          `================================================================`
+      );
+      logElapsed();
+      process.exit(2);
+    }
     console.error(`\nError: ${error.message}`);
     if (error.response?.data) {
       console.error(JSON.stringify(error.response.data, null, 2));
